@@ -1,33 +1,31 @@
-<p align="center">
-  <img src="logos/pukucloud-tile.svg" width="96" alt="PukuCloud logo" />
-</p>
+<div align="center">
 
-<h1 align="center">PukuCloud</h1>
+<img src="logos/pukucloud-tile.svg" alt="PukuCloud" width="120" />
 
-<p align="center">
-  Open-source Firecracker microVM sandboxes and managed PostgreSQL, self-hosted.
-</p>
+# PukuCloud
 
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License" /></a>
-  <a href=".github/workflows/ci.yml"><img src="https://github.com/pukucloud/pukucloud/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-  <a href="https://github.com/pukucloud/pukucloud/stargazers"><img src="https://img.shields.io/github/stars/pukucloud-io/pukucloud-ai?style=social" alt="GitHub stars" /></a>
-</p>
+**Disposable Firecracker microVMs and managed PostgreSQL — one control plane, one scheduler, one snapshot pipeline.**
 
-<p align="center">
-  <img width="1657" height="949" alt="PukuCloud dashboard" src="https://github.com/user-attachments/assets/72a7e7dc-2218-4ecb-acfb-953e278f3406" />
-</p>
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![TypeScript](https://img.shields.io/badge/TypeScript-Workers-3178C6?logo=typescript&logoColor=white)](https://workers.cloudflare.com)
+[![Firecracker](https://img.shields.io/badge/Firecracker-microVM-FF6B35)](https://firecracker-microvm.github.io)
+[![Postgres](https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org)
+
+[Quickstart](#60-second-quickstart) · [Features](#features) · [Architecture](#architecture-at-a-glance) · [Self-host](#self-host) · [Docs](docs/README.md)
+
+</div>
 
 ---
 
 ## What is PukuCloud?
 
-PukuCloud is two products on one control plane:
+PukuCloud ships two products on one control plane:
 
-- **Disposable Firecracker microVM sandboxes** for AI agents and untrusted code.
+- **Disposable Firecracker microVM sandboxes** — for AI agents and untrusted code. Sub-second boot from baked snapshots, demand-paged memory and rootfs, snapshot/fork trees, full lifecycle (pause, resume, hibernate, TTL).
 - **Managed PostgreSQL 16 databases (Beta)** — a real, durable database in its own microVM, with a native `postgres://` URL in seconds, continuous WAL archiving, and restore-based failover onto a healthy host.
 
-Both run on the same control plane, the same scheduler, the same agent fleet, and the same object-storage snapshot pipeline. See [docs/architecture.md](docs/architecture.md) for the full picture.
+Both share the same control plane, scheduler, agent fleet, and snapshot pipeline. See [docs/architecture.md](docs/architecture.md) for the full picture.
 
 ---
 
@@ -35,8 +33,8 @@ Both run on the same control plane, the same scheduler, the same agent fleet, an
 
 ```bash
 git clone https://github.com/pukucloud/pukucloud
-cd pukucloud-ai
-bash scripts/mac-local-e2e.sh
+cd pukucloud
+bash scripts/mac-local-e2e.sh   # or scripts/linux-local-e2e.sh on Linux/KVM
 open http://localhost:3000
 ```
 
@@ -55,7 +53,7 @@ Exec a command in it:
 curl -sS http://localhost:8080/v1/sandboxes/<id>/exec \
   -H 'Authorization: Bearer pds_local_dev_token' \
   -H 'Content-Type: application/json' \
-  -d '{"cmd":"echo","args":["hello"]}'
+  -d '{"cmd":"uname","args":["-a"]}'
 ```
 
 > Other paths into the project:
@@ -124,20 +122,13 @@ curl -sS -X DELETE "$PUKUCLOUD_API/v1/sandboxes/$SBX" \
   -H "Authorization: Bearer $PUKUCLOUD_API_KEY"
 ```
 
-The Python and TypeScript SDKs and the `pukucloud` CLI are published separately (`pip install pukucloud`, `npm install @pukucloud/sdk`). In this repo you talk to the platform over the REST API directly.
+Python and TypeScript SDKs and the `pukucloud` CLI are published separately (`pip install pukucloud`, `npm install @pukucloud/sdk`). In this repo you talk to the platform over the REST API directly.
 
 ---
 
 ## Architecture at a glance
 
-```text
-+--------+      +-----------+      +------------------+      +----------------------+
-| Client | ---> | API       | ---> | Agents per host  | ---> | Firecracker microVMs |
-+--------+      +-----------+      +------------------+      +----------------------+
-                     |                    |
-                     v                    v
-               Postgres/audit        Snapshot seeds + UFFD/NBD streaming
-```
+![Architecture](git-content/ReadmeArchitecture.png)
 
 - **API** — the control plane. Either the self-hosted Go API (`api/`) or the Cloudflare Workers deployment (`workers/`). Same REST surface, same auth, same scheduler.
 - **Agents** — one per KVM host. Boot and manage Firecracker microVMs.

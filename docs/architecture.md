@@ -22,37 +22,7 @@ How PukuCloud fits together: the control plane, the data plane, and the workload
 
 PukuCloud is split along a clean control-plane / data-plane boundary. The control plane decides; the data plane executes. Workloads live one layer further down, isolated inside Firecracker microVMs.
 
-```text
-+-------------------------------------------------------------------+
-|                       CONTROL PLANE                                |
-|  - REST API, auth, tokens, orgs                                   |
-|  - Template catalog, snapshot registry, DB catalog                |
-|  - Scheduler (capacity scoring, leases)                           |
-|                                                                   |
-|  Implementations:                                                 |
-|    * Self-hosted Go API   (api/)                                  |
-|    * Cloudflare Workers   (workers/ — production target)          |
-+-------------------------------------------------------------------+
-                              |
-                              |  (one HTTPS hop per /v1/* request)
-                              v
-+-------------------------------------------------------------------+
-|                       DATA PLANE                                  |
-|  - One Firecracker agent per KVM host                             |
-|  - Boots and tears down microVMs                                  |
-|  - Hosts the snapshot store, UFFD/NBD streamers                   |
-|  - Reads audit/event/metrics writes back to ClickHouse            |
-+-------------------------------------------------------------------+
-                              |
-                              v
-+-------------------------------------------------------------------+
-|                   WORKLOAD MICROVMS                               |
-|  - Firecracker microVMs restored from per-template snapshots      |
-|  - Sandboxes for AI agents / untrusted code                       |
-|  - Managed-Postgres databases (one DB per microVM)                |
-|  - Volumes attach as virtio-blk devices                           |
-+-------------------------------------------------------------------+
-```
+![Architecutral Diagram](../git-content/Architecture.png)
 
 The control plane never touches guest memory or disks directly — it only talks to agents over HTTPS, and the agents do the actual Firecracker work.
 
@@ -171,40 +141,7 @@ The Go API ships a full implementation; the Workers deployment uses a simpler st
 
 A typical self-hosted AWS or GCP fleet looks like:
 
-```text
-                            internet
-                                |
-                                v
-                          Cloudflare proxy
-                                |
-                                v
-                       edge ASG / MIG  (TLS, API)
-                          /         \
-                         v           v
-                   RDS / Cloud SQL  ClickHouse VM
-                   (audit, tokens,  (events, metrics,
-                    templates)       boots)
-                                ^
-                                |
-                                v  (heartbeat, leases)
-                +-------------------------------+
-                |                               |
-                v                               v
-         agent host 1                   agent host 2
-         (c5n.metal / n2-std)           (c5n.metal / n2-std)
-         - Firecracker                  - Firecracker
-         - chunk cache                  - chunk cache
-         - UFFD / NBD                   - UFFD / NBD
-         - WAL archive                  - WAL failover target
-                \                               /
-                 \                             /
-                  v                           v
-                  +--- db-proxy (SNI 5432) ---+
-                          \                 /
-                           v               v
-                       *.db.<zone>     dashboard.<zone>
-                       (TLS Postgres)  (Cloudflare Pages)
-```
+![Multi Topology](../git-content/MultipleTopology.png)
 
 Concrete numbers (instance sizes, costs, caveats) live in [infra/README.md](../infra/README.md). The Cloudflare Workers deployment shrinks the control plane to "just the edge" and lets you keep the same agent fleet — see [setup-control-plane-cloudflare.md](setup-control-plane-cloudflare.md).
 
