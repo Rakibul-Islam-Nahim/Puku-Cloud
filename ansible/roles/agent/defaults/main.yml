@@ -1,0 +1,15 @@
+---
+agent_gcs_bucket: REPLACE_WITH_YOUR_GCS_BUCKET
+agent_gcs_object: bin/pukucloud-agent
+agent_bin_path: /usr/local/bin/pukucloud-agent
+agent_candidate_path: /tmp/pukucloud-agent.candidate
+agent_service: pukucloud-agent
+agent_restart_on_change: true
+# Sanity floor: a real agent binary is tens of MB. Guards against pushing a
+# truncated/empty object.
+agent_min_bytes: 5000000
+
+# Swap backing for the memory pressure ladder's squeeze rung. zswap keeps the
+# common case in compressed RAM; the file is the overflow.
+agent_swapfile_size: 16G
+agent_zswap_max_pool_percent: 25

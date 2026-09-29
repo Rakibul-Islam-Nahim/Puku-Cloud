@@ -1,0 +1,144 @@
+---
+title: Workspace MCP Server
+description: A workspace-level MCP endpoint at /mcp — connect Claude, Cursor, or any MCP client once and manage sandboxes, databases, and templates with 11 tools.
+---
+
+PukuCloud ships a **workspace-level MCP server**. Where the [per-sandbox MCP endpoint](/docs/concepts/mcp) turns one sandbox into a tool, this endpoint turns your **whole workspace** into one: the model can create and destroy sandboxes, run commands, read/write files, and provision Postgres databases — all through a single URL and your existing API token.
+
+```
+POST https://api.pukucloud.ai/mcp
+Content-Type: application/json
+Authorization: Bearer pds_...
+```
+
+`POST /v1/mcp` is an alias. The transport is stateless streamable-HTTP JSON-RPC 2.0 — every request stands alone, no session handshake required, so it works with every MCP client that supports remote HTTP servers.
+
+## Tools
+
+11 tools, mirroring the REST API. Every call is scoped to the workspace your token belongs to and runs exactly the same control-plane path as the equivalent REST call.
+
+### Sandboxes
+
+| Tool              | Arguments                                          | Equivalent REST call                    |
+| ----------------- | -------------------------------------------------- | --------------------------------------- |
+| `create_sandbox`  | `{template?, ttl_seconds?, metadata?}`             | `POST /v1/sandboxes`                     |
+| `list_sandboxes`  | `{}`                                               | `GET /v1/sandboxes`                      |
+| `delete_sandbox`  | `{sandbox_id}`                                     | `DELETE /v1/sandboxes/{id}`              |
+| `run_command`     | `{sandbox_id, command, timeout_seconds?}`          | `POST /v1/sandboxes/{id}/exec`           |
+| `read_file`       | `{sandbox_id, path}`                               | `GET /v1/sandboxes/{id}/fs`              |
+| `write_file`      | `{sandbox_id, path, content}`                      | `PUT /v1/sandboxes/{id}/fs`              |
+| `list_dir`        | `{sandbox_id, path}`                               | `GET /v1/sandboxes/{id}/fs/dir`          |
+
+`create_sandbox` defaults to the `code-interpreter` template. `run_command` defaults to a 60-second timeout (max 300).
+
+### Databases
+
+| Tool               | Arguments     | Equivalent REST call          |
+| ------------------ | ------------- | ----------------------------- |
+| `create_database`  | `{label?}`    | `POST /v1/databases`          |
+| `list_databases`   | `{}`          | `GET /v1/databases`           |
+| `delete_database`  | `{database_id}` | `DELETE /v1/databases/{id}` |
+
+`create_database` blocks until PostgreSQL is ready (30–90s) and returns the connection URL.
+
+### Templates
+
+| Tool             | Arguments              | Equivalent REST call             |
+| ---------------- | ---------------------- | -------------------------------- |
+| `list_templates` | `{}`                   | `GET /v1/templates`              |
+
+## Quick test with curl
+
+```bash
+# Handshake
+curl -s -X POST https://api.pukucloud.ai/mcp \
+  -H "Authorization: Bearer $PUKUCLOUD_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize",
+       "params":{"protocolVersion":"2025-03-26"}}'
+
+# Discover tools
+curl -s -X POST https://api.pukucloud.ai/mcp \
+  -H "Authorization: Bearer $PUKUCLOUD_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+
+# Spin up a sandbox and run a command
+curl -s -X POST https://api.pukucloud.ai/mcp \
+  -H "Authorization: Bearer $PUKUCLOUD_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call",
+       "params":{"name":"create_sandbox","arguments":{"template":"code-interpreter"}}}'
+
+curl -s -X POST https://api.pukucloud.ai/mcp \
+  -H "Authorization: Bearer $PUKUCLOUD_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call",
+       "params":{"name":"run_command",
+                 "arguments":{"sandbox_id":"<id from previous call>","command":"python3 -c \"print(2+2)\""}}}'
+```
+
+Results follow the standard MCP `content[]` convention; failed upstream calls come back with `isError: true` and the REST error body as text.
+
+## Client configuration
+
+### Claude Code
+
+```bash
+claude mcp add --transport http pukucloud \
+  https://api.pukucloud.ai/mcp \
+  --header "Authorization: Bearer pds_..."
+```
+
+### Claude Desktop / other stdio-only clients
+
+Use the standard remote bridge:
+
+```json
+{
+  "mcpServers": {
+    "pukucloud": {
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote",
+        "https://api.pukucloud.ai/mcp",
+        "--header", "Authorization: Bearer pds_..."
+      ]
+    }
+  }
+}
+```
+
+### Cursor
+
+`.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "pukucloud": {
+      "url": "https://api.pukucloud.ai/mcp",
+      "headers": { "Authorization": "Bearer pds_..." }
+    }
+  }
+}
+```
+
+After connecting, ask the model things like *"create a sandbox and benchmark this script"* or *"spin up a Postgres database for this project"* — the tools do the rest.
+
+## Auth, limits, and behavior
+
+- **Auth**: the same `Bearer pds_...` workspace token as the REST API. `401` without one.
+- **Abuse guard**: `tools/call` is rate-limited per workspace per minute — **60/min by default**, configurable with `PUKUCLOUD_MCP_RATE_PER_MIN` on the API. Exceeding returns JSON-RPC error `-32000`; `initialize` and `tools/list` are never rate-limited. This is a runaway-loop guard, not a usage quota.
+- **Stateless**: no sessions to manage; safe to use from many clients concurrently.
+- **Request body cap**: 1 MiB. JSON-RPC batch arrays are not supported (`-32600`).
+
+## Workspace vs per-sandbox MCP
+
+| | Workspace (`/mcp`) | Per-sandbox (`/v1/sandboxes/{id}/mcp`) |
+| --- | --- | --- |
+| Scope | whole workspace | one sandbox |
+| Lifecycle tools | create/delete sandboxes and databases | none — sandbox must already exist |
+| Best for | agents that manage infrastructure | giving a model one disposable Linux box |
+
+They compose: use the workspace server to `create_sandbox`, then hand the per-sandbox MCP URL to a narrower-scoped agent that should only touch that box.

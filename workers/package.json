@@ -1,0 +1,35 @@
+{
+  "name": "pukucloud-workers",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PukuCloud control plane on Cloudflare Workers (Hono + D1 + R2)",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "build": "wrangler deploy --dry-run --outdir=dist",
+    "deploy": "wrangler deploy",
+    "deploy:staging": "wrangler deploy --env staging",
+    "deploy:prod": "wrangler deploy --env production",
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit",
+    "db:migrate:local": "wrangler d1 migrations apply pukucloud-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply pukucloud-db --remote",
+    "db:reset:local": "wrangler d1 migrations apply pukucloud-db --local --delete",
+    "r2:create": "wrangler r2 bucket create pukucloud-snapshots",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "hono": "^4.6.14",
+    "jose": "^5.9.6",
+    "zod": "^3.23.8",
+    "nanoid": "^5.0.9"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241218.0",
+    "@cloudflare/vitest-pool-workers": "^0.5.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8",
+    "wrangler": "^3.99.0"
+  }
+}

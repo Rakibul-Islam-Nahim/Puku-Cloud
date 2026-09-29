@@ -1,0 +1,41 @@
+---
+title: Self-host overview
+description: Run PukuCloud on your own infrastructure — GCP, AWS, Mac M1, or bare metal.
+---
+
+PukuCloud is split into a control plane, agents, and Firecracker-based sandbox hosts. Self-hosting means running those services yourself and pointing clients at your API endpoint.
+
+## Client configuration
+
+Use the same SDKs and CLI against your endpoint:
+
+```bash
+export PUKUCLOUD_API_KEY=pds_abc123def456...
+export PUKUCLOUD_API=https://api.pukucloud.ai
+```
+
+For a private deployment, replace `PUKUCLOUD_API` with your HTTPS API origin.
+
+## Build the CLI
+
+```bash
+git clone https://github.com/pukucloud/pukucloud
+cd pukucloud/cmd/pukucloud
+go build -o /usr/local/bin/pukucloud ./
+```
+
+## Smoke test
+
+```bash
+pukucloud auth whoami
+pukucloud template list
+pukucloud sandbox create --template base --ttl 1h
+pukucloud sandbox list
+```
+
+## Related deployment guides
+
+- [Deploy on-prem](/docs/deploy/deploy-on-prem)
+- [Deploy on Mac (M1/M2/M3)](/docs/deploy/deploy-mac-m1)
+
+The CLI does not include `deploy` subcommands; deployment automation lives outside the `pukucloud` command surface.

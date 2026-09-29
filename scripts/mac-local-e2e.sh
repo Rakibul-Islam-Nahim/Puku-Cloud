@@ -1,0 +1,782 @@
+#!/usr/bin/env bash
+# Fully automated PukuCloud local E2E bootstrap for Mac Apple Silicon.
+# Runs Firecracker inside an arm64 Lima VM with Apple VZ nested virtualization,
+# while Postgres, ClickHouse, API, and dashboard run locally on macOS.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATE_DIR="$REPO_ROOT/.local-state/mac-local-e2e"
+BIN_DIR="$STATE_DIR/bin"
+LOG_DIR="$STATE_DIR/logs"
+LIMA_NAME="pukucloud-lima-vm"
+LIMA_YAML="$STATE_DIR/lima.yaml"
+TOKEN="pds_local_dev_token"
+NODE_TOKEN="pds_local_node_token"
+PUKUCLOUD_STUB_USER_EMAIL="${PUKUCLOUD_STUB_USER_EMAIL:-dev@local.pukucloud}"
+PUKUCLOUD_STUB_USER_ID="${PUKUCLOUD_STUB_USER_ID:-00000000-0000-0000-0000-000000000001}"
+PUKUCLOUD_STUB_ORG_ID="${PUKUCLOUD_STUB_ORG_ID:-00000000-0000-0000-0000-000000000002}"
+PUKUCLOUD_STUB_WORKSPACE="${PUKUCLOUD_STUB_WORKSPACE:-local-dev}"
+WORKSPACE="$PUKUCLOUD_STUB_WORKSPACE"
+COMPOSE=(docker compose -f "$REPO_ROOT/docker-compose.dev.yml")
+API_PID="$STATE_DIR/api.pid"
+DASHBOARD_PID="$STATE_DIR/dashboard.pid"
+DB_PROXY_PID="$STATE_DIR/db-proxy.pid"
+TOKENS_FILE="$STATE_DIR/tokens.json"
+# Native-postgres local connectivity (db-proxy). The proxy listens on 5433
+# (5432 is the control-plane Postgres) and routes by SNI {id}.db.localhost,
+# resolved to 127.0.0.1 via dnsmasq. Set ENABLE_DB_PROXY=0 to skip it.
+ENABLE_DB_PROXY="${ENABLE_DB_PROXY:-1}"
+DB_PROXY_PORT="${DB_PROXY_PORT:-5433}"
+DB_SNI_SUFFIX="${DB_SNI_SUFFIX:-.db.localhost}"
+DB_PROXY_CERT_DIR="$STATE_DIR/db-proxy-cert"
+PG_DSN_HOST="postgres://pukucloud:pukucloud@localhost:5432/pukucloud?sslmode=disable"
+PG_DSN_VM="postgres://pukucloud:pukucloud@host.lima.internal:5432/pukucloud?sslmode=disable"
+CLICKHOUSE_URL="http://pukucloud:pukucloud@localhost:8123/pukucloud"
+
+GREEN='\033[0;32m'; YELLOW='\033[0;33m'; RED='\033[0;31m'; NC='\033[0m'
+step() { printf "\n${GREEN}┌─ %s${NC}\n" "$*"; }
+warn() { printf "${YELLOW}!${NC} %s\n" "$*"; }
+die()  { printf "${RED}✗ %s${NC}\n" "$*" >&2; exit 1; }
+
+port_must_be_free_or_owned() {
+  local port="$1" pid_file="$2" label="$3" owners owner_pids=""
+  command -v lsof >/dev/null 2>&1 || return 0
+  owners="$(lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | sort -u || true)"
+  [[ -z "$owners" ]] && return 0
+  if [[ -f "$pid_file" ]]; then
+    owner_pids="$(cat "$pid_file" 2>/dev/null || true)"
+  fi
+  while IFS= read -r pid; do
+    [[ -z "$pid" ]] && continue
+    if [[ "$pid" == "$owner_pids" ]] && kill -0 "$pid" 2>/dev/null; then
+      continue
+    fi
+    die "$label port $port is already in use by pid $pid. Stop that process or run scripts/mac-local-e2e-down.sh, then rerun."
+  done <<< "$owners"
+}
+
+need_darwin_arm64() {
+  [[ "$(uname -s)" == "Darwin" ]] || die "This bootstrap is for macOS/Darwin only. Use Linux self-host docs on Linux."
+  [[ "$(uname -m)" == "arm64" ]] || die "This bootstrap requires Apple Silicon (arm64: M1/M2/M3)."
+}
+
+go_major() {
+  go env GOVERSION 2>/dev/null | sed -E 's/^go[0-9]+\.([0-9]+).*/\1/'
+}
+
+node_major() {
+  node --version 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/'
+}
+
+ensure_brew() {
+  command -v brew >/dev/null 2>&1 || die "Homebrew is required. Install from https://brew.sh, then rerun this script."
+}
+
+brew_install_if_missing() {
+  local formula="$1" command_name="$2"
+  if command -v "$command_name" >/dev/null 2>&1; then
+    return
+  fi
+  step "Installing $formula with Homebrew"
+  brew install "$formula"
+}
+
+ensure_prereqs() {
+  ensure_brew
+  brew_install_if_missing lima limactl
+  brew_install_if_missing docker docker
+  brew_install_if_missing jq jq
+  brew_install_if_missing curl curl
+
+  if ! command -v go >/dev/null 2>&1 || [[ "${GO_MAJOR:-$(go_major || echo 0)}" -lt 22 ]]; then
+    step "Installing Go with Homebrew"
+    brew install go
+  fi
+  if ! command -v node >/dev/null 2>&1 || [[ "${NODE_MAJOR:-$(node_major || echo 0)}" -lt 20 ]]; then
+    step "Installing Node.js with Homebrew"
+    brew install node
+  fi
+  if ! command -v pnpm >/dev/null 2>&1 && ! command -v npm >/dev/null 2>&1; then
+    step "Installing pnpm with Homebrew"
+    brew install pnpm
+  fi
+
+  if ! docker info >/dev/null 2>&1; then
+    warn "Docker daemon is not responding. Starting Docker Desktop if available."
+    if [[ -d /Applications/Docker.app ]]; then
+      open -a Docker || true
+    fi
+    for _ in {1..60}; do
+      docker info >/dev/null 2>&1 && break
+      sleep 2
+    done
+  fi
+  docker info >/dev/null 2>&1 || die "Docker is installed but not running. Start Docker Desktop and rerun."
+
+  # Guard against rogue ancestor lockfiles that confuse Next 16 Turbopack.
+  # If $HOME/package-lock.json (or pnpm-lock.yaml / yarn.lock) exists, Next
+  # picks $HOME as the workspace root and watches the entire home tree —
+  # this can balloon to tens of GB of RAM on Apple Silicon. We pin
+  # turbopack.root in next.config.ts, but warn the user too.
+  for ancestor_lock in "$HOME/package-lock.json" "$HOME/pnpm-lock.yaml" "$HOME/yarn.lock"; do
+    if [[ -f "$ancestor_lock" ]]; then
+      warn "Stray lockfile detected at $ancestor_lock — recommended to delete it. (next.config.ts pins turbopack.root, so this should no longer matter, but a stray $HOME lockfile is almost always accidental.)"
+    fi
+  done
+}
+
+write_lima_yaml() {
+  mkdir -p "$STATE_DIR"
+  cat > "$LIMA_YAML" <<YAML
+# Generated by scripts/mac-local-e2e.sh. Safe to delete with scripts/mac-local-e2e-down.sh.
+vmType: vz
+arch: aarch64
+cpus: 4
+memory: 6GiB
+disk: 30GiB
+nestedVirtualization: true
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+mounts:
+  - location: "$REPO_ROOT"
+    mountPoint: "/workspace"
+    writable: true
+
+containerd:
+  system: false
+  user: false
+
+portForwards:
+  - guestPort: 7070
+    hostPort: 7070
+  - guestPort: 9100
+    hostPort: 9100
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euxo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y ca-certificates curl wget jq squashfs-tools iproute2 iptables uuid-runtime e2fsprogs sqlite3 openssh-client rsync
+      groupadd -f kvm
+      usermod -aG kvm ubuntu || true
+      install -d -m 0755 /var/lib/pukucloud/{install,kernels,templates,vms,snapshots}
+      install -d -m 0755 /run/pukucloud
+      install -d -m 0750 /etc/pukucloud
+      sysctl -w net.ipv4.ip_forward=1
+      echo net.ipv4.ip_forward=1 > /etc/sysctl.d/99-pukucloud.conf
+YAML
+}
+
+ensure_lima() {
+  write_lima_yaml
+  if ! limactl list --format '{{.Name}}' 2>/dev/null | grep -qx "$LIMA_NAME"; then
+    step "Creating Lima VM ($LIMA_NAME)"
+    limactl create --name "$LIMA_NAME" --tty=false "$LIMA_YAML"
+  fi
+  if [[ "$(limactl list --format '{{.Status}}' "$LIMA_NAME" 2>/dev/null || echo Stopped)" != "Running" ]]; then
+    step "Starting Lima VM ($LIMA_NAME)"
+    limactl start --tty=false "$LIMA_NAME"
+  fi
+
+  step "Verifying nested KVM in Lima"
+  limactl shell --workdir /workspace "$LIMA_NAME" -- sudo bash -lc 'test -e /dev/kvm && test -r /dev/kvm && test -w /dev/kvm' \
+    || die "Lima started, but /dev/kvm is unavailable. Apple VZ nested virtualization is required; update macOS/Lima or use a Linux KVM host."
+}
+
+install_firecracker_and_template() {
+  step "Installing Firecracker and default template in Lima"
+  limactl shell --workdir /workspace "$LIMA_NAME" -- sudo bash -lc '
+    set -euo pipefail
+    FC_VERSION="v1.16.0"
+    ARCH="aarch64"
+    WORK="/var/lib/pukucloud/install"
+    mkdir -p "$WORK" /var/lib/pukucloud/kernels /var/lib/pukucloud/templates/ubuntu-24.04
+    cd "$WORK"
+    if ! command -v firecracker >/dev/null 2>&1; then
+      curl -fL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-${ARCH}.tgz" -o firecracker.tgz
+      tar -xzf firecracker.tgz
+      install -m 0755 "release-${FC_VERSION}-${ARCH}/firecracker-${FC_VERSION}-${ARCH}" /usr/local/bin/firecracker
+      install -m 0755 "release-${FC_VERSION}-${ARCH}/jailer-${FC_VERSION}-${ARCH}" /usr/local/bin/jailer
+      rm -rf firecracker.tgz "release-${FC_VERSION}-${ARCH}"
+    fi
+    if ! ls /var/lib/pukucloud/kernels/vmlinux-5.10* >/dev/null 2>&1; then
+      key=$(curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min?prefix=firecracker-ci/v1.13/${ARCH}/vmlinux-5.10&list-type=2" | grep -oP "(?<=<Key>)(firecracker-ci/v1.13/${ARCH}/vmlinux-5\.10\.[0-9]+)(?=</Key>)" | sort -V | tail -1)
+      test -n "$key"
+      curl -fL "https://s3.amazonaws.com/spec.ccfc.min/${key}" -o "/var/lib/pukucloud/kernels/$(basename "$key")"
+    fi
+    if [[ ! -f /var/lib/pukucloud/templates/ubuntu-24.04/rootfs.ext4 ]]; then
+      key=$(curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min?prefix=firecracker-ci/v1.13/${ARCH}/ubuntu-&list-type=2" | grep -oP "(?<=<Key>)(firecracker-ci/v1.13/${ARCH}/ubuntu-[0-9]+\.[0-9]+\.squashfs)(?=</Key>)" | sort -V | tail -1)
+      test -n "$key"
+      cd /var/lib/pukucloud/templates/ubuntu-24.04
+      curl -fL "https://s3.amazonaws.com/spec.ccfc.min/${key}" -o ubuntu.squashfs
+      rm -rf squashfs-root
+      unsquashfs -d squashfs-root ubuntu.squashfs >/dev/null
+      truncate -s 10G rootfs.ext4
+      mkfs.ext4 -d squashfs-root -F rootfs.ext4 >/dev/null
+      rm -rf squashfs-root ubuntu.squashfs
+      cat > meta.json <<JSON
+{"name":"ubuntu-24.04","arch":"aarch64","cpu":1,"memory_mb":256,"disk_gb":10,"kernel":"vmlinux-5.10"}
+JSON
+    fi
+    firecracker --version
+  '
+}
+
+# seed_base_template derives the universal "base" template from the freshly
+# seeded ubuntu-24.04 rootfs. This is the single, language-agnostic sandbox
+# runtime (replacing the old per-language templates).
+#
+# It ships:
+#   - build essentials (git curl ca-certificates build-essential xz-utils unzip
+#     pkg-config) so most native build steps work out of the box;
+#   - mise (https://mise.jdx.dev) — one static arm64 binary that manages runtime
+#     versions for node/python/go/ruby/bun/deno/java/etc. and reads idiomatic
+#     version files (.nvmrc/.python-version/.tool-versions/mise.toml);
+#   - pre-warmed Node 24 LTS + Python 3.12 + Go (latest) + Bun via `mise use -g`
+#     plus the pnpm + yarn package managers, so the common JS/TS/Python/Go cases
+#     deploy instantly (no runtime download at build time). Anything else is
+#     installed on demand by `mise install` during the build.
+#
+# Deterministic, root-owned mise layout (resolvable from non-login `sh -c`
+# exec sessions used by the build pipeline):
+#   MISE_DATA_DIR=/opt/mise  MISE_CONFIG_DIR=/opt/mise  shims=/opt/mise/shims
+#
+# Bakes memory_mb 4096 (Firecracker snapshot freezes RAM at bake time, so this
+# is the guest's real memory ceiling — sized for BUILDS: Next/Vite/tsc prod
+# builds spike 2.5-4 GiB and OOM at 2 GiB) and grows the rootfs to 14 GiB
+# (mise + four runtimes + package managers + build caches need the headroom).
+# Idempotent.
+seed_base_template() {
+  step "Seeding universal 'base' runtime template (mise + Node 24 + Python 3.12 + Go + Bun + pnpm/yarn, 4 GiB / 14 GiB)"
+  limactl shell --workdir /workspace "$LIMA_NAME" -- sudo bash -lc '
+    set -euo pipefail
+    SRC=/var/lib/pukucloud/templates/ubuntu-24.04
+    DST=/var/lib/pukucloud/templates/base
+    MNT=/tmp/base-rootfs-mnt
+    if [[ -f "$DST/rootfs.ext4" ]]; then
+      echo "base template already present; skipping"
+      exit 0
+    fi
+    test -f "$SRC/rootfs.ext4" || { echo "ubuntu-24.04 rootfs missing"; exit 1; }
+    mkdir -p "$DST"
+    # Reflink if the filesystem supports it, else a plain copy.
+    cp --reflink=auto "$SRC/rootfs.ext4" "$DST/rootfs.ext4"
+    # Grow the rootfs from 10G -> 14G to fit mise + runtimes + build caches.
+    truncate -s 14G "$DST/rootfs.ext4"
+    e2fsck -fy "$DST/rootfs.ext4" >/dev/null 2>&1 || true
+    resize2fs "$DST/rootfs.ext4" >/dev/null 2>&1
+
+    # Mount and chroot-install the toolchain.
+    for m in "$MNT/proc" "$MNT/sys" "$MNT/dev" "$MNT"; do umount "$m" 2>/dev/null || true; done
+    mkdir -p "$MNT"
+    mount -o loop "$DST/rootfs.ext4" "$MNT"
+    mount --bind /proc "$MNT/proc"
+    mount --bind /sys "$MNT/sys"
+    mount --bind /dev "$MNT/dev"
+    printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > "$MNT/etc/resolv.conf"
+    chmod 1777 "$MNT/tmp"
+    chroot "$MNT" /bin/bash -c "
+      set -e
+      export DEBIAN_FRONTEND=noninteractive
+      chmod 1777 /tmp
+      mkdir -p /var/cache/apt/archives/partial /var/lib/apt/lists/partial /var/log/apt
+      APTOPT=\"-o APT::Sandbox::User=root\"
+      apt-get \$APTOPT update -y
+      apt-get \$APTOPT install -y --no-install-recommends \
+        git curl ca-certificates build-essential xz-utils unzip pkg-config
+
+      # --- mise: single static binary, deterministic root-owned layout ---
+      export MISE_DATA_DIR=/opt/mise MISE_CONFIG_DIR=/opt/mise MISE_YES=1
+      mkdir -p /opt/mise
+      curl -fsSL https://mise.jdx.dev/mise-latest-linux-arm64 -o /usr/local/bin/mise
+      chmod 0755 /usr/local/bin/mise
+      mise --version
+
+      # Make the mise env + shims resolvable for EVERY session, not just login
+      # shells: detached \"setsid sh -c\" sessions source neither /etc/profile.d
+      # nor a Docker ENV, and a mise shim is inert without MISE_DATA_DIR /
+      # MISE_CONFIG_DIR. Bake the resolution into /etc/environment (read by PAM
+      # for every session) plus a login-shell fallback. NODE_OPTIONS raises the
+      # Node heap so JS builds use the baked RAM. Keep in sync with
+      # templates/base/Dockerfile.
+      cat > /etc/environment <<ENVFILE
+MISE_DATA_DIR=/opt/mise
+MISE_CONFIG_DIR=/opt/mise
+PATH=/opt/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+NODE_OPTIONS=--max-old-space-size=3072
+ENVFILE
+      cat > /etc/profile.d/mise.sh <<PROFILE
+export MISE_DATA_DIR=/opt/mise
+export MISE_CONFIG_DIR=/opt/mise
+export PATH=/opt/mise/shims:\\\$PATH
+export NODE_OPTIONS=--max-old-space-size=3072
+PROFILE
+
+      # Pre-warm the common runtimes globally (precompiled, no source build).
+      # Node 24 LTS + Python 3.12 + Go (latest) + Bun, then pnpm + yarn package
+      # managers (installed against the pre-warmed Node so their shims exist).
+      mise use -g node@24
+      mise use -g python@3.12
+      mise use -g go@latest
+      mise use -g bun@latest
+      mise reshim
+      /opt/mise/shims/npm install -g pnpm yarn
+      mise reshim
+      ls -la /opt/mise/shims | head
+      /opt/mise/shims/node -v
+      /opt/mise/shims/python --version
+      /opt/mise/shims/go version
+      /opt/mise/shims/bun --version
+      /opt/mise/shims/pnpm --version
+      /opt/mise/shims/yarn --version
+
+      # Real-binary symlinks into /usr/local/bin (belt-and-suspenders): even a
+      # process with a clobbered PATH, or a tool hardcoding /usr/local/bin/node,
+      # resolves the runtimes without shim machinery. Verify under an EMPTY env
+      # (the worst case a detached setsid child inherits) or fail the seed.
+      for b in node npm npx python python3 pip pip3 go bun pnpm yarn; do
+        t=\$(/usr/local/bin/mise which \$b 2>/dev/null || true)
+        [ -n \"\$t\" ] && [ -x \"\$t\" ] && ln -sf \"\$t\" /usr/local/bin/\$b || true
+      done
+      env -i /usr/local/bin/node -v
+      env -i /usr/local/bin/python --version
+      env -i /usr/local/bin/python3 --version || ln -sf /usr/local/bin/python /usr/local/bin/python3
+
+      apt-get clean
+      rm -rf /var/lib/apt/lists/*
+      git --version
+    "
+    umount "$MNT/proc" "$MNT/sys" "$MNT/dev"
+    umount "$MNT"
+
+    cat > "$DST/meta.json" <<JSON
+{"name":"base","arch":"aarch64","cpu":8,"memory_mb":4096,"disk_gb":14,"kernel":"vmlinux-5.10"}
+JSON
+    echo "base template ready:"; ls -la "$DST"
+  '
+}
+
+seed_tokens() {
+  step "Seeding local dev token"
+  mkdir -p "$STATE_DIR" "$LOG_DIR" "$BIN_DIR"
+  cat > "$TOKENS_FILE" <<JSON
+[
+  {"token":"$TOKEN","workspace":"$WORKSPACE","label":"local-e2e","created_at":"2026-01-01T00:00:00Z"}
+]
+JSON
+}
+
+start_databases() {
+  step "Starting Postgres and ClickHouse with Docker Compose"
+  (cd "$REPO_ROOT" && "${COMPOSE[@]}" up -d postgres clickhouse)
+  for _ in {1..60}; do
+    docker exec pukucloud-dev-postgres-1 pg_isready -U pukucloud >/dev/null 2>&1 && break
+    sleep 2
+  done
+  docker exec pukucloud-dev-postgres-1 pg_isready -U pukucloud >/dev/null 2>&1 || die "Postgres did not become healthy"
+
+  # Stale pg_data volume guard. Postgres only runs initdb on an empty volume;
+  # if the volume was created by a prior compose run with different env vars,
+  # the pukucloud role/db never get created. Detect and bootstrap.
+  if ! docker exec pukucloud-dev-postgres-1 psql -U pukucloud -d pukucloud -c '\q' >/dev/null 2>&1; then
+    step "Bootstrapping pukucloud role/db (stale pg_data volume detected)"
+    bootstrapped=0
+    for super_user in postgres pukucloud; do
+      if docker exec pukucloud-dev-postgres-1 psql -U "$super_user" -d postgres -c '\q' >/dev/null 2>&1; then
+        docker exec pukucloud-dev-postgres-1 psql -U "$super_user" -d postgres -v ON_ERROR_STOP=0 <<SQL >/dev/null 2>&1 || true
+DO \$\$BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'pukucloud') THEN
+    CREATE ROLE pukucloud LOGIN PASSWORD 'pukucloud' SUPERUSER;
+  ELSE
+    ALTER ROLE pukucloud WITH LOGIN PASSWORD 'pukucloud' SUPERUSER;
+  END IF;
+END\$\$;
+SQL
+        docker exec pukucloud-dev-postgres-1 psql -U "$super_user" -d postgres -tc \
+          "SELECT 1 FROM pg_database WHERE datname='pukucloud'" 2>/dev/null | grep -q 1 || \
+          docker exec pukucloud-dev-postgres-1 psql -U "$super_user" -d postgres \
+            -c "CREATE DATABASE pukucloud OWNER pukucloud;" >/dev/null 2>&1 || true
+        bootstrapped=1
+        break
+      fi
+    done
+    if [[ "$bootstrapped" == "0" ]]; then
+      die "Cannot bootstrap pukucloud role. Stale pg_data volume — run: docker compose -f docker-compose.dev.yml down -v && retry"
+    fi
+    docker exec pukucloud-dev-postgres-1 psql -U pukucloud -d pukucloud -c '\q' >/dev/null 2>&1 \
+      || die "pukucloud role bootstrap failed"
+  fi
+
+  for _ in {1..60}; do
+    curl -fsS http://localhost:8123/ping >/dev/null 2>&1 && break
+    sleep 2
+  done
+  curl -fsS http://localhost:8123/ping >/dev/null 2>&1 || die "ClickHouse did not become healthy"
+
+  # Apply ClickHouse schema (idempotent; CREATE DATABASE/TABLE IF NOT EXISTS).
+  # Use clickhouse-client inside the container — the HTTP endpoint rejects
+  # multi-statement bodies on CH 24+ ('Multi-statements are not allowed').
+  if [[ -f "$REPO_ROOT/agent/internal/clickhouse/schema.sql" ]]; then
+    step "Applying ClickHouse schema (pukucloud db + tables)"
+    docker exec -i pukucloud-dev-clickhouse-1 clickhouse-client \
+      --user=pukucloud --password=pukucloud --multiquery \
+      < "$REPO_ROOT/agent/internal/clickhouse/schema.sql" \
+      || warn "ClickHouse schema apply failed (metrics flush may 404 — non-fatal)"
+  fi
+}
+
+seed_stub_identity() {
+  step "Seeding local stub user, organization, and workspace"
+  docker exec -i pukucloud-dev-postgres-1 psql -U pukucloud -d pukucloud -v ON_ERROR_STOP=1 \
+    -v user_id="$PUKUCLOUD_STUB_USER_ID" \
+    -v user_email="$PUKUCLOUD_STUB_USER_EMAIL" \
+    -v org_id="$PUKUCLOUD_STUB_ORG_ID" \
+    -v workspace="$PUKUCLOUD_STUB_WORKSPACE" <<'SQL'
+CREATE TABLE IF NOT EXISTS workspaces (
+    name TEXT PRIMARY KEY,
+    max_sandboxes BIGINT DEFAULT 16,
+    max_cpu_total BIGINT DEFAULT 16,
+    max_memory_mb_total BIGINT DEFAULT 32768,
+    hourly_create_limit BIGINT DEFAULT 200,
+    created_at BIGINT
+);
+CREATE TABLE IF NOT EXISTS orgs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS org_members (
+    org_id UUID NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL,
+    email TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL CHECK (role IN ('owner','admin','member')),
+    joined_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (org_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS user_current_org (
+    user_id TEXT PRIMARY KEY,
+    org_id UUID NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO workspaces (name, created_at) VALUES (:'workspace', EXTRACT(EPOCH FROM now())::BIGINT) ON CONFLICT (name) DO NOTHING;
+INSERT INTO orgs (id, slug, name, owner_user_id) VALUES (:'org_id'::uuid, :'workspace', 'Local Dev', :'user_id') ON CONFLICT (id) DO NOTHING;
+INSERT INTO org_members (org_id, user_id, email, role) VALUES (:'org_id'::uuid, :'user_id', :'user_email', 'owner') ON CONFLICT DO NOTHING;
+INSERT INTO user_current_org (user_id, org_id) VALUES (:'user_id', :'org_id'::uuid) ON CONFLICT (user_id) DO NOTHING;
+SQL
+}
+
+build_and_start_agent() {
+  step "Building Linux arm64 agent"
+  mkdir -p "$BIN_DIR" "$LOG_DIR"
+  (cd "$REPO_ROOT/agent" && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o "$BIN_DIR/pukucloud-agent-linux-arm64" ./cmd/agent)
+
+  step "Starting host agent inside Lima"
+  limactl shell --workdir /workspace "$LIMA_NAME" -- sudo install -m 0755 /workspace/.local-state/mac-local-e2e/bin/pukucloud-agent-linux-arm64 /usr/local/bin/pukucloud-agent
+  limactl shell --workdir /workspace "$LIMA_NAME" -- sudo tee /etc/pukucloud/local-e2e.env >/dev/null <<ENV
+PUKUCLOUD_DB_DRIVER=postgres
+PUKUCLOUD_DB_DSN=$PG_DSN_VM
+PUKUCLOUD_NODE_TOKEN=$NODE_TOKEN
+PUKUCLOUD_LISTEN_TCP=0.0.0.0:7070
+PUKUCLOUD_AGENT_ENDPOINT=http://127.0.0.1:7070
+PUKUCLOUD_AGENT_ID=mac-local-lima
+PUKUCLOUD_REGION=local
+PUKUCLOUD_ZONE=mac
+PUKUCLOUD_METRICS_LISTEN=0.0.0.0:9100
+PUKUCLOUD_CLICKHOUSE_URL=http://pukucloud:pukucloud@host.lima.internal:8123/pukucloud
+ENV
+  limactl shell --workdir /workspace "$LIMA_NAME" -- sudo tee /etc/systemd/system/pukucloud-agent-local-e2e.service >/dev/null <<'UNIT'
+[Unit]
+Description=PukuCloud local E2E Firecracker host agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/pukucloud/local-e2e.env
+ExecStart=/usr/local/bin/pukucloud-agent -socket /run/pukucloud/agent.sock -data-dir /var/lib/pukucloud -db /var/lib/pukucloud/pukucloud.db
+Restart=on-failure
+RestartSec=5
+StartLimitInterval=120
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  limactl shell --workdir /workspace "$LIMA_NAME" -- sudo systemctl daemon-reload
+  limactl shell --workdir /workspace "$LIMA_NAME" -- sudo systemctl enable --now pukucloud-agent-local-e2e.service
+  for _ in {1..60}; do
+    curl -fsS http://localhost:7070/healthz >/dev/null 2>&1 && break
+    sleep 2
+  done
+  curl -fsS http://localhost:7070/healthz >/dev/null 2>&1 || {
+    limactl shell --workdir /workspace "$LIMA_NAME" -- sudo journalctl -u pukucloud-agent-local-e2e.service -n 80 --no-pager || true
+    die "Agent did not become healthy"
+  }
+}
+
+build_and_start_api() {
+  step "Building and starting API on macOS"
+  (cd "$REPO_ROOT/api" && go build -o "$BIN_DIR/pukucloud-api" ./cmd/api)
+  # Pull the dashboard URL from .env.local without sourcing the whole file —
+  # sourcing would clobber the Lima-topology vars set above. Read only if not
+  # already present in env.
+  # `|| true`: a key absent from .env.local makes grep exit 1, which under
+  # `set -euo pipefail` silently kills the whole bootstrap right after the
+  # API build — this key is OPTIONAL (guarded by [[ -n "$v" ]] below).
+  if [[ -f "$REPO_ROOT/.env.local" ]]; then
+    for k in PUKUCLOUD_DASHBOARD_URL; do
+      if [[ -z "${!k:-}" ]]; then
+        v="$(grep -E "^${k}=" "$REPO_ROOT/.env.local" | head -1 | cut -d= -f2- || true)"
+        [[ -n "$v" ]] && export "$k=$v"
+      fi
+    done
+  fi
+  port_must_be_free_or_owned 8080 "$API_PID" "API"
+  if [[ -f "$API_PID" ]] && kill -0 "$(cat "$API_PID")" 2>/dev/null; then
+    warn "API already running with pid $(cat "$API_PID")"
+  else
+    (
+      cd "$REPO_ROOT"
+      env \
+        PUKUCLOUD_DB_DSN="$PG_DSN_HOST" \
+        PUKUCLOUD_NODE_TOKEN="$NODE_TOKEN" \
+        PUKUCLOUD_REGION=local \
+        PUKUCLOUD_CLICKHOUSE_URL="$CLICKHOUSE_URL" \
+        PUKUCLOUD_METRICS_LISTEN=:9101 \
+        PUKUCLOUD_AUTH_SKIP_PREFIXES=/healthz,/version \
+        PUKUCLOUD_AUTH_MODE=stub \
+        PUKUCLOUD_STUB_USER_EMAIL="$PUKUCLOUD_STUB_USER_EMAIL" \
+        PUKUCLOUD_STUB_USER_ID="$PUKUCLOUD_STUB_USER_ID" \
+        PUKUCLOUD_STUB_ORG_ID="$PUKUCLOUD_STUB_ORG_ID" \
+        PUKUCLOUD_STUB_WORKSPACE="$PUKUCLOUD_STUB_WORKSPACE" \
+        PUKUCLOUD_API_BASE_URL="${PUKUCLOUD_API_BASE_URL:-http://localhost:8080}" \
+        PUKUCLOUD_DB_SNI_SUFFIX="$([[ "$ENABLE_DB_PROXY" == "1" ]] && echo "$DB_SNI_SUFFIX" || echo "")" \
+        PUKUCLOUD_DB_PROXY_PORT="$([[ "$ENABLE_DB_PROXY" == "1" ]] && echo "$DB_PROXY_PORT" || echo "")" \
+        PUKUCLOUD_DASHBOARD_URL="${PUKUCLOUD_DASHBOARD_URL:-http://localhost:3000}" \
+        "$BIN_DIR/pukucloud-api" -addr :8080 -token-file "$TOKENS_FILE" \
+          >"$LOG_DIR/api.log" 2>&1 &
+      echo $! > "$API_PID"
+    )
+  fi
+  for _ in {1..60}; do
+    curl -fsS http://localhost:8080/healthz >/dev/null 2>&1 && break
+    sleep 2
+  done
+  curl -fsS http://localhost:8080/healthz >/dev/null 2>&1 || die "API did not become healthy; see $LOG_DIR/api.log"
+}
+
+start_dashboard() {
+  step "Starting dashboard on macOS"
+  port_must_be_free_or_owned 3000 "$DASHBOARD_PID" "Dashboard"
+  if [[ -f "$DASHBOARD_PID" ]] && kill -0 "$(cat "$DASHBOARD_PID")" 2>/dev/null; then
+    warn "Dashboard already running with pid $(cat "$DASHBOARD_PID")"
+    return
+  fi
+  (cd "$REPO_ROOT/dashboard" && npm ci --no-audit --no-fund)
+  (
+    cd "$REPO_ROOT/dashboard"
+    env \
+      NEXT_PUBLIC_PUKUCLOUD_API=http://localhost:8080 \
+      NEXT_PUBLIC_PUKUCLOUD_AUTH_MODE=stub \
+      NEXT_PUBLIC_PUKUCLOUD_STUB_USER_EMAIL="$PUKUCLOUD_STUB_USER_EMAIL" \
+      NEXT_PUBLIC_PUKUCLOUD_STUB_USER_ID="$PUKUCLOUD_STUB_USER_ID" \
+      NEXT_PUBLIC_PUKUCLOUD_STUB_ORG_ID="$PUKUCLOUD_STUB_ORG_ID" \
+      NEXT_PUBLIC_PUKUCLOUD_STUB_WORKSPACE="$PUKUCLOUD_STUB_WORKSPACE" \
+      npm run dev -- --hostname 127.0.0.1 --port 3000 \
+      >"$LOG_DIR/dashboard.log" 2>&1 &
+    echo $! > "$DASHBOARD_PID"
+  )
+  for _ in {1..60}; do
+    curl -fsS http://localhost:3000 >/dev/null 2>&1 && break
+    sleep 2
+  done
+  curl -fsS http://localhost:3000 >/dev/null 2>&1 || die "Dashboard did not become healthy; see $LOG_DIR/dashboard.log"
+}
+
+# start_db_proxy makes the *native* postgres:// connection URL work on localhost.
+# In production this runs on a VM behind {id}.db.pukucloud.ai:5432; locally we
+# run the same binary on the Mac host and route by SNI {id}.db.localhost:5433:
+#
+#   psql → {id}.db.localhost (→ 127.0.0.1 via dnsmasq) :5433 → db-proxy
+#        → TLS handshake (SNI = {id}.db.localhost, self-signed wildcard cert)
+#        → catalog lookup (leases JOIN agents) → HTTP-Upgrade pg-tunnel to the
+#          agent at 127.0.0.1:7070 → agent dials guest_ip:5432
+#
+# Requires sudo for the dnsmasq resolver file. Set ENABLE_DB_PROXY=0 to skip
+# (the REST query broker path always works without any of this).
+start_db_proxy() {
+  [[ "$ENABLE_DB_PROXY" == "1" ]] || { warn "db-proxy disabled (ENABLE_DB_PROXY=0); native postgres:// URLs won't resolve locally — use the REST query API"; return 0; }
+  step "Starting db-proxy for native postgres:// on localhost (SNI ${DB_SNI_SUFFIX}:${DB_PROXY_PORT})"
+
+  # 1. dnsmasq: resolve *<suffix> → 127.0.0.1. The suffix is e.g. .db.localhost,
+  #    so the dnsmasq domain is the suffix without the leading dot.
+  local dns_domain="${DB_SNI_SUFFIX#.}"
+  if ! command -v dnsmasq >/dev/null 2>&1; then
+    step "Installing dnsmasq with Homebrew"
+    brew install dnsmasq
+  fi
+  local dnsmasq_conf brew_prefix
+  brew_prefix="$(brew --prefix)"
+  dnsmasq_conf="$brew_prefix/etc/dnsmasq.d/pukucloud-db.conf"
+  mkdir -p "$brew_prefix/etc/dnsmasq.d"
+  if ! grep -qs "address=/${dns_domain}/127.0.0.1" "$dnsmasq_conf" 2>/dev/null; then
+    printf 'address=/%s/127.0.0.1\n' "$dns_domain" > "$dnsmasq_conf"
+    # dnsmasq.d may not be included by the main conf on a fresh brew install.
+    grep -qs "conf-dir=.*dnsmasq.d" "$brew_prefix/etc/dnsmasq.conf" 2>/dev/null || \
+      printf '\nconf-dir=%s/etc/dnsmasq.d,*.conf\n' "$brew_prefix" >> "$brew_prefix/etc/dnsmasq.conf"
+  fi
+  warn "dnsmasq + the macOS resolver need sudo (one time). You may be prompted."
+  sudo mkdir -p /etc/resolver
+  printf 'nameserver 127.0.0.1\n' | sudo tee "/etc/resolver/${dns_domain}" >/dev/null
+  sudo brew services restart dnsmasq >/dev/null 2>&1 || sudo "$brew_prefix/sbin/dnsmasq" --conf-file="$brew_prefix/etc/dnsmasq.conf" 2>/dev/null || true
+  # Verify resolution (give the resolver a moment).
+  for _ in {1..10}; do
+    dscacheutil -q host -a name "probe${DB_SNI_SUFFIX}" 2>/dev/null | grep -q "127.0.0.1" && break
+    sleep 1
+  done
+  dscacheutil -q host -a name "probe${DB_SNI_SUFFIX}" 2>/dev/null | grep -q "127.0.0.1" \
+    || warn "wildcard DNS for *${DB_SNI_SUFFIX} not confirmed; native URLs may still fail to resolve"
+
+  # 2. Self-signed wildcard cert for *.<suffix> (TLS only; psql uses sslmode=require).
+  mkdir -p "$DB_PROXY_CERT_DIR"
+  if [[ ! -f "$DB_PROXY_CERT_DIR/fullchain.pem" ]]; then
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -keyout "$DB_PROXY_CERT_DIR/privkey.pem" \
+      -out "$DB_PROXY_CERT_DIR/fullchain.pem" \
+      -subj "/CN=*${DB_SNI_SUFFIX}" \
+      -addext "subjectAltName=DNS:*${DB_SNI_SUFFIX},DNS:${dns_domain}" >/dev/null 2>&1
+  fi
+
+  # 3. Build + run the db-proxy on the Mac host.
+  (cd "$REPO_ROOT/db-proxy" && go build -o "$BIN_DIR/pukucloud-db-proxy" .)
+  if [[ -f "$DB_PROXY_PID" ]] && kill -0 "$(cat "$DB_PROXY_PID" 2>/dev/null)" 2>/dev/null; then
+    echo "db-proxy already running (pid $(cat "$DB_PROXY_PID"))"
+  else
+    env \
+      PUKUCLOUD_DB_DSN="$PG_DSN_HOST" \
+      PUKUCLOUD_NODE_TOKEN="$NODE_TOKEN" \
+      PUKUCLOUD_CERT_DIR="$DB_PROXY_CERT_DIR" \
+      PUKUCLOUD_LISTEN_ADDR=":${DB_PROXY_PORT}" \
+      PUKUCLOUD_SNI_SUFFIX="$DB_SNI_SUFFIX" \
+      PUKUCLOUD_METRICS_ADDR=":5544" \
+      "$BIN_DIR/pukucloud-db-proxy" >"$LOG_DIR/db-proxy.log" 2>&1 &
+    echo $! > "$DB_PROXY_PID"
+  fi
+  for _ in {1..20}; do
+    nc -z 127.0.0.1 "$DB_PROXY_PORT" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  nc -z 127.0.0.1 "$DB_PROXY_PORT" >/dev/null 2>&1 \
+    && echo "  db-proxy listening on :${DB_PROXY_PORT}" \
+    || warn "db-proxy not listening on :${DB_PROXY_PORT}; see $LOG_DIR/db-proxy.log"
+}
+
+smoke_test() {
+  step "Running smoke test: create sandbox, exec echo hello, verify dashboard"
+  local auth=(-H "Authorization: Bearer $TOKEN" -H "content-type: application/json")
+  local tpl id out
+  # Prefer the 'base' template: it is the one this script actually builds a
+  # local rootfs for (seed_base_template). Other catalog entries (agent,
+  # code-interpreter) are registered but their images are synced from object
+  # storage in production, so they have no local rootfs here and would 500 on
+  # create.
+  for _ in {1..60}; do
+    tpl=$(curl -fsS "${auth[@]}" http://localhost:8080/v1/templates \
+      | jq -r '(map(.name) | index("base")) as $i | if $i then "base" else (.[0].name // empty) end' 2>/dev/null || true)
+    [[ -n "$tpl" ]] && break
+    sleep 2
+  done
+  [[ -n "${tpl:-}" ]] || die "No templates visible through API"
+  id=$(curl -fsS "${auth[@]}" -X POST http://localhost:8080/v1/sandboxes \
+    -d "{\"template\":\"$tpl\",\"cpu\":1,\"memory_mb\":256,\"ttl_seconds\":600}" | jq -r .id)
+  [[ -n "$id" && "$id" != "null" ]] || die "Sandbox create failed"
+  echo "$id" > "$STATE_DIR/last-sandbox-id"
+
+  for i in {1..90}; do
+    out=$(curl -fsS "${auth[@]}" -X POST "http://localhost:8080/v1/sandboxes/$id/exec" -d '{"cmd":"echo hello"}' 2>/dev/null | jq -r '.stdout // empty' || true)
+    if [[ "$out" == "hello" ]]; then
+      local code
+      code=$(curl -o /dev/null -sS -w "%{http_code}" http://localhost:3000/sandboxes || true)
+      [[ "$code" == "200" ]] || die "Dashboard /sandboxes returned HTTP $code, expected 200"
+      curl -fsS "${auth[@]}" http://localhost:8080/v1/sandboxes | jq -e --arg id "$id" 'any(.[]; .id == $id)' >/dev/null \
+        || die "Smoke-test sandbox is not visible in the sandbox list"
+      printf "${GREEN}✓ smoke test passed${NC}\n"
+      return
+    fi
+    sleep 2
+    [[ $i -eq 90 ]] && break
+  done
+  curl -fsS "${auth[@]}" -X DELETE "http://localhost:8080/v1/sandboxes/$id" >/dev/null || true
+  die "Smoke test failed: exec did not return hello"
+}
+
+# seed_postgres_template bakes the managed-database template (postgres-16) into
+# the Lima VM by running the production baker (scripts/bake-templates.sh) against
+# the local `base` rootfs. This is what makes `POST /v1/databases` work in local
+# dev — without it, only `base` is creatable.
+#
+# The repo is bind-mounted at /workspace inside Lima, so the baker and the
+# postgres-16 template sources are already present. bake-templates.sh clones the
+# base rootfs, chroot-installs Postgres 16 + pgvector + the query-broker, and
+# registers /var/lib/pukucloud/templates/postgres-16/. Idempotent (skips if the
+# rootfs already exists; set FORCE=1 to rebake). ~5-10 min the first time.
+#
+# To bake the OTHER first-party templates (agent, code-interpreter) the same
+# way, see docs-site/.../getting-started/local-testing.mdx.
+seed_postgres_template() {
+  step "Baking 'postgres-16' template in Lima (managed databases; ~5-10 min first run)"
+  limactl shell --workdir /workspace "$LIMA_NAME" -- sudo bash -lc '
+    set -euo pipefail
+    if [[ -f /var/lib/pukucloud/templates/postgres-16/rootfs.ext4 ]]; then
+      echo "postgres-16 template already present; skipping"
+      exit 0
+    fi
+    test -f /var/lib/pukucloud/templates/base/rootfs.ext4 || { echo "base template missing; run seed_base_template first"; exit 1; }
+    # Bake postgres-16 off the local "base" rootfs (apt-ready, arm64).
+    BASE_NAME=base bash /workspace/scripts/bake-templates.sh postgres-16
+  '
+}
+
+main() {
+  need_darwin_arm64
+  ensure_prereqs
+  seed_tokens
+  start_databases
+  seed_stub_identity
+  ensure_lima
+  install_firecracker_and_template
+  seed_base_template
+  seed_postgres_template
+  build_and_start_agent
+  build_and_start_api
+  start_dashboard
+  start_db_proxy
+  smoke_test
+
+  printf "\n${GREEN}╰─ PukuCloud local E2E is up${NC}\n"
+  cat <<EOF
+  Dashboard:  http://localhost:3000
+  API:        http://localhost:8080
+  Agent:      http://localhost:7070 (inside Lima: $LIMA_NAME)
+  Postgres:   localhost:5432 (pukucloud/pukucloud)
+  ClickHouse: http://localhost:8123 (pukucloud/pukucloud)
+  Default user: $PUKUCLOUD_STUB_USER_EMAIL
+  Auth:       Auto-login is enabled (stub mode)
+  Token:      $TOKEN
+
+Tear down everything with:
+  bash scripts/mac-local-e2e-down.sh
+EOF
+}
+
+main "$@"

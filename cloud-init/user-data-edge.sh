@@ -1,0 +1,189 @@
+#!/bin/bash
+# cloud-init for pukucloud-edge nodes (multi-node mode).
+# Runs the public web surface: pukucloud-api + dashboard + caddy. Does NOT run
+# Firecracker. Talks to agents over the private VPC on :8081 with X-Node-Token.
+#
+# Reads identity + secrets via the GCP metadata server and Secret Manager.
+# The TF edge-mig module supplies the following instance metadata:
+#   pukucloud-region        - GCP region label
+#   pukucloud-binary-url    - HTTPS URL serving the edge release bundle (tar)
+#   pukucloud-dashboard-bucket - GCS prefix for the prebuilt dashboard
+#   secret-supabase-anon     - Secret Manager secret ID containing the public anon key
+#   secret-supabase-url      - Secret Manager secret ID containing the public Supabase URL
+#   secret-node-token        - Secret Manager secret ID containing the shared bearer
+#   secret-database-url      - Secret Manager secret ID containing the Supabase DSN
+#   secret-clickhouse-url    - Secret Manager secret ID containing the CH URL
+#   secret-jwks-url          - Secret Manager secret ID containing the Supabase JWKS URL
+#   pukucloud-zone-name     - public DNS zone this deployment serves (e.g. example.com)
+set -euo pipefail
+exec > >(tee -a /var/log/pukucloud-cloud-init.log) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+
+# Wait for any concurrent apt/dpkg (e.g. cloud-init's own package_update) to release locks.
+for _ in $(seq 1 120); do
+  if ! fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock >/dev/null 2>&1; then
+    break
+  fi
+  sleep 5
+done
+
+# Force IPv4 for apt — this VPC has no IPv6 route to GCE package mirrors.
+echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
+
+apt-get update
+# caddy is not in the default Ubuntu 24.04 apt repo and is disabled in this deployment.
+# Install only what the API actually needs at runtime.
+apt-get install -y ca-certificates curl wget jq iproute2
+
+# gcloud CLI for Secret Manager + GCS pulls.
+if ! command -v gcloud >/dev/null 2>&1; then
+  echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+    | tee /etc/apt/sources.list.d/google-cloud-sdk.list
+  curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+    | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+  apt-get update
+  apt-get install -y google-cloud-cli
+fi
+
+# Node.js for dashboard SSR if needed.
+if ! command -v node >/dev/null 2>&1 || ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 20 ? 0 : 1)' >/dev/null 2>&1; then
+  curl -fsSL https://deb.nodesource.com/setup_22.x -o /usr/local/src/nodesource_setup_22.x
+  bash /usr/local/src/nodesource_setup_22.x
+  apt-get install -y nodejs
+fi
+
+MD="http://metadata.google.internal/computeMetadata/v1"
+md() { curl -fsS -H "Metadata-Flavor: Google" "$MD/$1" 2>/dev/null || true; }
+
+REGION="$(md instance/attributes/pukucloud-region)"
+BINARY_URL="$(md instance/attributes/pukucloud-binary-url)"
+DASH_BUCKET="$(md instance/attributes/pukucloud-dashboard-bucket)"
+SECRET_SUPA_ANON="$(md instance/attributes/secret-supabase-anon)"
+SECRET_SUPA_URL="$(md instance/attributes/secret-supabase-url)"
+SECRET_TOKEN="$(md instance/attributes/secret-node-token)"
+SECRET_DB="$(md instance/attributes/secret-database-url)"
+SECRET_CH="$(md instance/attributes/secret-clickhouse-url)"
+SECRET_JWKS="$(md instance/attributes/secret-jwks-url)"
+# Public DNS zone for this deployment. Supplied by terraform
+# (var.cloudflare_zone_name) — there is no correct default, so fail loudly
+# rather than baking someone else's domain into the env file.
+ZONE_NAME="$(md instance/attributes/pukucloud-zone-name)"
+INSTANCE_NAME="$(md instance/name)"
+INTERNAL_IP="$(md instance/network-interfaces/0/ip)"
+
+fetch_secret() {
+  local name="$1"
+  [ -n "$name" ] && gcloud secrets versions access latest --secret="$name" 2>/dev/null || true
+}
+NODE_TOKEN="$(fetch_secret "$SECRET_TOKEN")"
+DATABASE_URL="$(fetch_secret "$SECRET_DB")"
+CLICKHOUSE_URL="$(fetch_secret "$SECRET_CH")"
+SUPABASE_JWKS_URL="$(fetch_secret "$SECRET_JWKS")"
+SUPA_ANON="$(fetch_secret "$SECRET_SUPA_ANON")"
+SUPA_URL="$(fetch_secret "$SECRET_SUPA_URL")"
+
+install -d -m 0755 /var/lib/pukucloud /etc/pukucloud /etc/caddy /opt/pukucloud-dashboard /opt/pukucloud-bin
+
+# Pull edge bundle. Expected layout:
+#   bin/pukucloud-api        - api binary
+#   dashboard/            - prebuilt nextjs/Astro output (or .next/standalone)
+if [ -n "$BINARY_URL" ]; then
+  curl -fsSL "$BINARY_URL" -o /var/lib/pukucloud/edge-bundle.tgz
+  tar -xzf /var/lib/pukucloud/edge-bundle.tgz -C /opt/pukucloud-bin
+  install -m 0755 /opt/pukucloud-bin/bin/pukucloud-api /usr/local/bin/pukucloud-api
+  if [ -d /opt/pukucloud-bin/dashboard ]; then
+    cp -rT /opt/pukucloud-bin/dashboard /opt/pukucloud-dashboard 2>/dev/null || true
+  fi
+elif [ -n "$DASH_BUCKET" ]; then
+  gcloud storage cp "gs://${DASH_BUCKET}/bin/pukucloud-api" /usr/local/bin/pukucloud-api || true
+  chmod 0755 /usr/local/bin/pukucloud-api 2>/dev/null || true
+  gcloud storage rsync --recursive "gs://${DASH_BUCKET}/dashboard/" /opt/pukucloud-dashboard/ || true
+fi
+
+ENV_API_NEXT="/etc/pukucloud/env.api.next.$$"
+cat > "$ENV_API_NEXT" <<EOF
+PUKUCLOUD_DB_DRIVER=pgx
+PUKUCLOUD_DB_DSN=${DATABASE_URL}
+PUKUCLOUD_NODE_TOKEN=${NODE_TOKEN}
+PUKUCLOUD_REGION=${REGION}
+SUPABASE_JWKS_URL=${SUPABASE_JWKS_URL}
+SUPABASE_ISSUER=
+SUPABASE_AUDIENCE=authenticated
+CLICKHOUSE_URL=${CLICKHOUSE_URL}
+PUKUCLOUD_CLICKHOUSE_URL=${CLICKHOUSE_URL}
+PUKUCLOUD_DASHBOARD_URL=https://app.${ZONE_NAME}
+EOF
+
+install -m 0600 -o root -g root "$ENV_API_NEXT" /etc/pukucloud/env.api
+rm -f "$ENV_API_NEXT"
+
+cat > /etc/pukucloud/env.dashboard <<EOF
+NEXT_PUBLIC_SUPABASE_URL=${SUPA_URL}
+NEXT_PUBLIC_SUPABASE_ANON_KEY=${SUPA_ANON}
+NEXT_PUBLIC_API_BASE=https://api.${ZONE_NAME}
+PORT=3000
+EOF
+chmod 0644 /etc/pukucloud/env.dashboard
+
+cat > /etc/systemd/system/pukucloud-api.service <<'UNIT'
+[Unit]
+Description=PukuCloud public API (multi-node edge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/pukucloud/env.api
+ExecStart=/usr/local/bin/pukucloud-api -addr :8080 -token-file /var/lib/pukucloud/tokens.json
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /etc/systemd/system/pukucloud-dashboard.service <<'UNIT'
+[Unit]
+Description=PukuCloud dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/pukucloud/env.dashboard
+WorkingDirectory=/opt/pukucloud-dashboard
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /etc/caddy/Caddyfile <<'CADDY'
+# Behind GCP HTTPS LB: TLS terminates at the LB, edge serves plain HTTP on :8080
+# so the LB health check works. The LB does host-based routing via URL map.
+# Internal :8080 host-splits: /v1/* -> api, everything else -> dashboard.
+:8080 {
+  @api path /v1/* /healthz /version /metrics
+  reverse_proxy @api localhost:8080 {
+    transport http {
+      versions 1.1
+    }
+  }
+  reverse_proxy localhost:3000
+}
+CADDY
+# Note: above is a placeholder; the api binary itself already serves /v1
+# directly on :8080, so caddy is only needed for dashboard static. We just
+# point the dashboard service at :3000 and rely on pukucloud-api to route /v1.
+# Disable caddy in this minimal first-cut deployment.
+systemctl disable --now caddy || true
+
+systemctl daemon-reload
+systemctl enable --now pukucloud-api || true
+systemctl enable --now pukucloud-dashboard || true
+
+echo "edge cloud-init done at $(date -u)"

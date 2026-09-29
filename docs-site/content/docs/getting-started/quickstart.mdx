@@ -1,0 +1,91 @@
+---
+title: Quickstart
+description: Spawn your first sandbox in 30 seconds — CLI, Python, and TypeScript.
+---
+
+## 1. Authenticate
+
+```bash
+export PUKUCLOUD_API_KEY=pds_abc123def456...
+export PUKUCLOUD_API=https://api.pukucloud.ai
+```
+
+Or sign in with the CLI:
+
+```bash
+pukucloud auth login
+pukucloud auth whoami
+```
+
+## 2. Create a sandbox
+
+```bash
+pukucloud sandbox create --template code-interpreter --ttl 1h
+pukucloud sandbox list
+```
+
+Available templates are `base`, `code-interpreter`, `agent`, and `postgres-16`. For anything else, [bake your own](/docs/concepts/templates#bake-your-own).
+
+## 3. Run a command
+
+```bash
+pukucloud sandbox exec <sandbox-id> -- python -c 'print("hello from PukuCloud")'
+pukucloud sandbox logs <sandbox-id> --no-follow --stream both
+```
+
+## Python
+
+```bash
+pip install pukucloud
+```
+
+```python
+from pukucloud import Sandbox
+
+sandbox = Sandbox.create(
+    template="code-interpreter",
+    ttl_seconds=3600,
+    metadata={"purpose": "quickstart"},
+)
+
+result = sandbox.exec("python -c 'print(1 + 1)'", timeout_seconds=30)
+print(result.stdout)
+
+sandbox.filesystem.write("/workspace/hello.py", "print('hi')\n")
+print(sandbox.filesystem.read("/workspace/hello.py"))
+
+sandbox.kill()
+```
+
+## TypeScript
+
+```bash
+npm install @pukucloud/sdk
+```
+
+```ts
+import { Sandbox } from "@pukucloud/sdk";
+
+const sandbox = await Sandbox.create({
+  template: "code-interpreter",
+  ttlSeconds: 3600,
+  metadata: { purpose: "quickstart" },
+});
+
+const result = await sandbox.exec("python -c 'print(1 + 1)'", { timeoutSeconds: 30 });
+console.log(result.stdout);
+
+await sandbox.filesystem.write("/workspace/hello.js", "console.log('hi')\n");
+console.log(await sandbox.filesystem.read("/workspace/hello.js"));
+
+await sandbox.kill();
+```
+
+## Preview a service
+
+```bash
+pukucloud sandbox exec <sandbox-id> -- python -m http.server 3000
+pukucloud sandbox preview-url <sandbox-id> 3000 --ttl 1h
+```
+
+SDK equivalents are `sandbox.preview_url(3000)` in Python and `sandbox.previewUrl(3000)` in TypeScript.

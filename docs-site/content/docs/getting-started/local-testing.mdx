@@ -1,0 +1,171 @@
+---
+title: Local testing & baking templates
+---
+
+# Local testing & baking templates
+
+> **Single-tenant dev mode.** This page assumes you've already run the local
+> bootstrap from the [Apple Silicon guide](/docs/getting-started/local-mac-apple-silicon)
+> (`bash scripts/mac-local-e2e.sh`) and have the agent running inside a Lima VM.
+
+## What gets seeded by default
+
+To keep the first-run fast, `scripts/mac-local-e2e.sh` only bakes the two
+templates most people need:
+
+| Template | What it is | Baked locally? |
+| --- | --- | --- |
+| `base` | Universal language runtime — Ubuntu 24.04 + mise (Node 22, Python 3.12, Go, Bun, pnpm/yarn). The general-purpose sandbox image. | ✅ yes |
+| `postgres-16` | Managed PostgreSQL 16 + pgvector + REST query broker. Backs `POST /v1/databases`. | ✅ yes |
+| `code-interpreter` | Python + Node + the data-science / Playwright stack. | ❌ on demand |
+| `agent` | Coding-agent CLI box (Node 22 + agent CLIs). | ❌ on demand |
+
+All four templates are **registered in the catalog** (they show up in
+`GET /v1/templates`), but only the baked ones have a local `rootfs.ext4`.
+Creating a sandbox from an unbaked template fails — the agent has no filesystem
+to boot:
+
+```text
+500  bake template key: mount rootfs: ... failed to setup loop device
+     for /var/lib/pukucloud/templates/<name>/rootfs.ext4
+```
+
+That's expected. Bake the template first (below) and the error goes away.
+
+## Test the seeded templates
+
+The agent runs inside Lima; the API is on your Mac at `:8080`. Use the local
+dev token:
+
+```bash
+export PUKUCLOUD_API=http://localhost:8080
+export TOKEN=pds_local_dev_token
+auth=(-H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json")
+
+# 1. base — create a sandbox and exec a command
+SBX=$(curl -fsS "${auth[@]}" -X POST $PUKUCLOUD_API/v1/sandboxes \
+  -d '{"template":"base"}' | jq -r .id)
+
+curl -fsS "${auth[@]}" -X POST $PUKUCLOUD_API/v1/sandboxes/$SBX/exec \
+  -d '{"cmd":"echo","args":["hello"]}'        # → {"stdout":"hello\n",...}
+
+curl -fsS "${auth[@]}" -X DELETE $PUKUCLOUD_API/v1/sandboxes/$SBX
+
+# 2. postgres-16 — provision a managed database (blocks ~30-90s until ready)
+curl -fsS "${auth[@]}" -X POST $PUKUCLOUD_API/v1/databases \
+  -d '{"label":"test-db"}'                     # → includes a connection_url
+```
+
+<Callout>
+First create from a freshly-baked template does a one-time cold boot (~3s) and
+captures a snapshot. Every create after that restores the snapshot in well under
+a second. Give the first call a few seconds before you decide it's stuck.
+</Callout>
+
+## Connecting to a managed database locally
+
+A created database returns two ways to connect, and both work in local dev:
+
+**1. REST query API (always works, no setup).** Run SQL over HTTP — the request
+is proxied through the API to the in-VM query broker. The DB record's
+`broker_url` and `broker_token` are all you need:
+
+```bash
+DB=<database-id>; BTOK=<broker-token>
+curl -sS -X POST "$PUKUCLOUD_API/v1/databases/$DB/proxy/v1/query" \
+  -H "Authorization: Bearer $BTOK" -H 'content-type: application/json' \
+  -d '{"database":"pukucloud","sql":"select version()"}'
+# → {"columns":[...],"rows":[["PostgreSQL 16.14 ..."]],"count":1,...}
+```
+
+**2. Native `postgres://` (via the local db-proxy).** `mac-local-e2e.sh` runs the
+db-proxy on `:5433` and points `*.db.localhost` at `127.0.0.1` (dnsmasq, set up
+during bootstrap — it needs `sudo` once). With that in place the
+`connection_url` works directly:
+
+```bash
+psql "$(curl -fsS "${auth[@]}" $PUKUCLOUD_API/v1/databases/$DB | jq -r .connection_url)?sslmode=require"
+```
+
+If you skipped the dnsmasq step (or ran with `ENABLE_DB_PROXY=0`), `<id>.db.localhost`
+won't resolve. You can still connect by pinning the address while keeping the SNI
+hostname — `libpq` accepts both:
+
+```bash
+psql "host=<id>.db.localhost hostaddr=127.0.0.1 port=5433 \
+      user=pukucloud dbname=pukucloud sslmode=require"
+```
+
+<Callout type="warn">
+The native host `<id>.db.localhost:5433` is a **local-dev** convenience. In
+production the same URL is `<id>.db.<your-domain>:5432`, served by the db-proxy
+behind real DNS + TLS. The REST query API path is identical in both.
+</Callout>
+
+## Bake the other templates
+
+The same production baker that runs in CI also runs locally. The repo is
+bind-mounted into the Lima VM at `/workspace`, so the baker and template sources
+are already there. Run it inside the VM, pointed at the local `base` rootfs:
+
+```bash
+# Bake one (or several) templates. ~5-15 min each — they install real toolchains.
+limactl shell --workdir /workspace pukucloud-lima-vm -- \
+  sudo BASE_NAME=base bash /workspace/scripts/bake-templates.sh code-interpreter
+
+# Bake several at once:
+limactl shell --workdir /workspace pukucloud-lima-vm -- \
+  sudo BASE_NAME=base bash /workspace/scripts/bake-templates.sh code-interpreter agent
+
+# Re-bake one that already exists (FORCE):
+limactl shell --workdir /workspace pukucloud-lima-vm -- \
+  sudo FORCE=1 BASE_NAME=base bash /workspace/scripts/bake-templates.sh postgres-16
+```
+
+What the baker does for each template: clone the `base` rootfs → grow it to the
+template's target size → `chroot` and install the template-specific packages →
+write `meta.json` → register it at `/var/lib/pukucloud/templates/<name>/`. It
+derives the guest arch from the host (`aarch64` inside Lima), and skips anything
+already baked unless `FORCE=1`.
+
+Once baked, the template is immediately creatable — no agent restart needed:
+
+```bash
+SBX=$(curl -fsS "${auth[@]}" -X POST $PUKUCLOUD_API/v1/sandboxes \
+  -d '{"template":"code-interpreter"}' | jq -r .id)
+curl -fsS "${auth[@]}" -X POST $PUKUCLOUD_API/v1/sandboxes/$SBX/exec \
+  -d '{"cmd":"python3","args":["-c","import numpy; print(numpy.__version__)"]}'
+```
+
+## Inspecting & resetting templates
+
+```bash
+# What's baked locally?
+limactl shell pukucloud-lima-vm -- sudo ls -la /var/lib/pukucloud/templates/
+
+# A template's metadata (arch / cpu / memory_mb / size):
+limactl shell pukucloud-lima-vm -- sudo cat /var/lib/pukucloud/templates/postgres-16/meta.json
+
+# Bake logs (per template):
+limactl shell pukucloud-lima-vm -- sudo cat /var/lib/pukucloud-work/bake/postgres-16.log
+```
+
+A template's baked memory size is frozen at bake time (Firecracker captures the
+guest's RAM into the snapshot), so the per-sandbox `cpu`/`memory_mb` in a create
+request are overridden to match the baked snapshot. To change a template's
+resources, edit its entry in `scripts/bake-templates.sh` and re-bake with
+`FORCE=1`.
+
+## Notes & gotchas
+
+- **`base` is the prerequisite for everything.** Every other template is baked
+  *from* the `base` rootfs, so seed it first (the bootstrap already does).
+- **Baking is slow the first time, fast after.** Each template installs a real
+  toolchain in a chroot. `code-interpreter` (data-science + Playwright) is the
+  heaviest.
+- **Disk.** Templates are multi-GB each (`postgres-16` ~12 GiB, `code-interpreter`
+  ~larger). The Lima VM's disk is 30 GiB by default — bake selectively, not all
+  four at once, unless you've grown the VM disk.
+- **Production bakes everything.** In a real deployment the
+  `.github/workflows/bake-templates.yml` pipeline bakes all templates to object
+  storage and the agents sync them; you only bake locally for dev/testing.

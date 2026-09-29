@@ -1,0 +1,53 @@
+---
+title: Deploy on-prem
+description: Run PukuCloud on your own bare-metal hardware.
+---
+
+On-prem deployments run the PukuCloud API, dashboard, scheduler, and one or more sandbox agents on your hardware. The `pukucloud` CLI does not deploy clusters; use your infrastructure tooling to run the services, then point clients at the API.
+
+## Domains
+
+For hosted PukuCloud:
+
+- Marketing: `pukucloud.ai`
+- Dashboard: `app.pukucloud.ai`
+- API: `api.pukucloud.ai`
+- Docs: `docs.pukucloud.ai`
+
+For an on-prem deployment, expose your own HTTPS API origin and set:
+
+```bash
+export PUKUCLOUD_API=https://api.pukucloud.ai
+export PUKUCLOUD_API_KEY=pds_abc123def456...
+```
+
+Replace the API URL with your private origin when self-hosting.
+
+## Build local tools
+
+```bash
+git clone https://github.com/pukucloud/pukucloud
+cd pukucloud/cmd/pukucloud
+go build -o /usr/local/bin/pukucloud ./
+```
+
+## Validate the deployment
+
+```bash
+curl -fsS https://api.pukucloud.ai/healthz
+curl -fsS https://api.pukucloud.ai/version
+
+pukucloud auth whoami
+pukucloud template list
+pukucloud sandbox create --template base --ttl 1h
+pukucloud sandbox list
+```
+
+## Operational checks
+
+```bash
+pukucloud sandbox logs <id> --stream both --no-follow
+pukucloud sandbox exec <id> -- uname -a
+pukucloud sandbox preview-url <id> 3000 --ttl 1h
+pukucloud sandbox delete <id>
+```

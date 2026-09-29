@@ -1,0 +1,13 @@
+app = "pukucloud-agent-single-node"
+primary_region = "ord"
+
+[build]
+  image = "ghcr.io/pukucloud-io/pukucloud-ai/agent:latest"
+
+[env]
+  PUKUCLOUD_CONTROL_PLANE_URL = "https://api.pukucloud.ai"
+
+[[vm]]
+  cpu_kind = "performance"
+  cpus = 4
+  memory = "8192mb"

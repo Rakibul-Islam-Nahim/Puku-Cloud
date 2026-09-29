@@ -1,0 +1,65 @@
+---
+title: Install the CLI
+description: The `pukucloud` CLI manages sandboxes, templates, tokens, and auth from your terminal.
+---
+
+## Build from source
+
+PukuCloud does not publish a shell installer. Build the CLI from the repository:
+
+```bash
+git clone https://github.com/pukucloud/pukucloud
+cd pukucloud/cmd/pukucloud
+go build -o /usr/local/bin/pukucloud ./
+```
+
+Make sure `/usr/local/bin` is on your `PATH`, or choose another output path that is.
+
+## Configure
+
+Use browser auth for dashboard-backed workflows:
+
+```bash
+pukucloud auth login
+pukucloud auth whoami
+```
+
+For token-based SDK or API access, set the real environment variables:
+
+```bash
+export PUKUCLOUD_API_KEY=pds_abc123def456...
+export PUKUCLOUD_API=https://api.pukucloud.ai
+```
+
+## Verify
+
+```bash
+$ pukucloud version
+pukucloud 0.5.0 (commit abc123)
+
+$ pukucloud sandbox list
+ID                                    TEMPLATE          STATUS   AGE
+278a4f42-3467-4424-98e6-a547646dd0fd  code-interpreter  running  2m
+```
+
+## Common commands
+
+```bash
+pukucloud sandbox create --template code-interpreter --ttl 1h
+pukucloud sandbox list
+pukucloud sandbox exec <id> -- python -c 'print(1 + 1)'
+pukucloud sandbox logs <id> --no-follow --stream both
+pukucloud sandbox ssh <id>
+pukucloud sandbox preview-url <id> 3000 --ttl 1h
+pukucloud sandbox delete <id>
+
+pukucloud template list
+pukucloud template build -f Dockerfile -n my-template --size-mb 2048
+pukucloud template delete my-template
+
+pukucloud token list
+pukucloud token create local-dev
+pukucloud token revoke pds_abc123
+```
+
+See [CLI reference](/docs/sdk/cli) for the full command tree.

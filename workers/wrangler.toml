@@ -1,0 +1,81 @@
+name = "pukucloud-api"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ---- Observability ------------------------------------------------------------
+[observability]
+enabled = true
+
+# ---- Vars ---------------------------------------------------------------------
+# Public, non-secret. Override per-env below.
+[vars]
+PUKUCLOUD_ENV = "production"
+PUKUCLOUD_API_VERSION = "0.1.0"
+# Agents reachable from Workers — comma-separated host:port for multi-node.
+PUKUCLOUD_AGENT_URLS = "https://agent-1.internal.example.com:9090,https://agent-2.internal.example.com:9090"
+# Edge entrypoint the dashboard / clients call.
+PUKUCLOUD_DASHBOARD_URL = "https://dashboard.example.com"
+
+# ---- D1 (control-plane state) -------------------------------------------------
+[[d1_databases]]
+binding = "DB"
+database_name = "pukucloud-db"
+database_id = "REPLACE_WITH_D1_ID"
+migrations_dir = "migrations"
+
+# ---- R2 (snapshot / seed / UFFD / NBD store) ----------------------------------
+[[r2_buckets]]
+binding = "SNAPSHOTS"
+bucket_name = "pukucloud-snapshots"
+# Optional: a second bucket for templates only.
+# [[r2_buckets]]
+# binding = "TEMPLATES"
+# bucket_name = "pukucloud-templates"
+
+# ---- KV (rate limiting, JWT cache, NAT-ID fast-path) -------------------------
+[[kv_namespaces]]
+binding = "CACHE"
+id = "REPLACE_WITH_KV_ID"
+
+# ---- Secrets (set with `wrangler secret put ...`) -----------------------------
+# PUKUCLOUD_AGENT_TOKEN       — bearer shared with agents
+# PUKUCLOUD_ADMIN_TOKEN       — bootstrap admin token
+# SUPABASE_JWKS_URL            — JWKS endpoint (or empty to disable JWT auth)
+# SUPABASE_ISSUER              — expected `iss` claim
+# SUPABASE_AUDIENCE            — expected `aud` claim
+# CLICKHOUSE_URL               — ClickHouse Cloud HTTPS endpoint
+# CLICKHOUSE_USER
+# CLICKHOUSE_PASSWORD
+# R2_SNAPSHOT_TOKEN            — optional signed-token for R2 Range GETs
+# CLOUDFLARE_API_TOKEN         — only if we need to manage DNS at request-time
+
+# ---- Service bindings (optional) ---------------------------------------------
+# [[services]]
+# binding = "DOCS"
+# service = "pukucloud-docs"
+
+# ---- Custom domains -----------------------------------------------------------
+# routes = [
+#   { pattern = "api.example.com/*", custom_domain = true },
+# ]
+
+# =============================================================================
+# Per-environment overrides
+# =============================================================================
+
+[env.staging]
+name = "pukucloud-api-staging"
+[env.staging.vars]
+PUKUCLOUD_ENV = "staging"
+PUKUCLOUD_DASHBOARD_URL = "https://staging.dashboard.example.com"
+PUKUCLOUD_AGENT_URLS = "https://agent-staging.internal.example.com:9090"
+[env.staging.d1_databases]
+binding = "DB"
+database_name = "pukucloud-db-staging"
+database_id = "REPLACE_WITH_STAGING_D1_ID"
+
+[env.production]
+name = "pukucloud-api"
+[env.production.vars]
+PUKUCLOUD_ENV = "production"

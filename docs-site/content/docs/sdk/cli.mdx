@@ -1,0 +1,100 @@
+---
+title: CLI reference
+description: pukucloud — the official CLI.
+---
+
+## Installation
+
+Build from source:
+
+```bash
+git clone https://github.com/pukucloud/pukucloud
+cd pukucloud/cmd/pukucloud
+go build -o /usr/local/bin/pukucloud ./
+```
+
+## Global flags
+
+```bash
+pukucloud -o json <command>
+```
+
+Use `-o json` for machine-readable output where supported.
+
+## Auth
+
+```bash
+pukucloud auth login
+pukucloud auth logout
+pukucloud auth whoami
+```
+
+Token-based clients use:
+
+```bash
+export PUKUCLOUD_API_KEY=pds_abc123def456...
+export PUKUCLOUD_API=https://api.pukucloud.ai
+```
+
+## Templates
+
+```bash
+pukucloud template list
+pukucloud template build -f Dockerfile -n code-interpreter --size-mb 2048
+pukucloud template delete code-interpreter
+```
+
+Known templates: `base`, `code-interpreter`, `agent`, `postgres-16`.
+
+## Sandboxes
+
+```bash
+pukucloud sandbox create --template code-interpreter --ttl 1h
+pukucloud sandbox list
+pukucloud sandbox get <id>
+pukucloud sandbox exec <id> --timeout 30 -- python -c 'print(42)'
+pukucloud sandbox logs <id> --no-follow --stream both
+pukucloud sandbox ssh <id>
+pukucloud sandbox cp ./local.txt <id>:/workspace/local.txt
+pukucloud sandbox cp <id>:/workspace/out.txt ./out.txt
+pukucloud sandbox pause <id>
+pukucloud sandbox resume <id>
+pukucloud sandbox snapshot <id>
+pukucloud sandbox fork <id>
+pukucloud sandbox hibernate <id>
+pukucloud sandbox wake <id>
+pukucloud sandbox set-ttl <id> 1h
+pukucloud sandbox preview-url <id> 3000 --ttl 1h
+pukucloud sandbox delete <id>
+```
+
+## Databases (Beta)
+
+Manage [managed PostgreSQL databases](/docs/concepts/databases). `db` is an alias for `database`.
+
+```bash
+pukucloud database create --label app
+pukucloud database list
+pukucloud database get <id>
+pukucloud database connection <id>
+pukucloud database delete <id>
+```
+
+`--label` is optional and just tags the database for easy identification in `list`. CPU and memory are fixed by the `postgres-16` template (baked into its snapshot at build time) and can't be set per-database. `connection` returns the `postgres://` URL for the database.
+
+## Tokens
+
+```bash
+pukucloud token list
+pukucloud token create local-dev
+pukucloud token revoke pds_abc123
+```
+
+## Misc
+
+```bash
+pukucloud version
+pukucloud help
+```
+
+There are no `volumes`, `files`, `deploy`, or `completion` subcommands in the current CLI. Use `sandbox cp` for file transfer and the SDK filesystem helpers for programmatic reads and writes.

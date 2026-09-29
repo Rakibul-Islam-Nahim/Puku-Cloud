@@ -1,0 +1,162 @@
+#!/bin/bash
+# cloud-init for pukucloud-edge nodes (AWS multi-node mode).
+#
+# AWS port of cloud-init/user-data-edge.sh. Runs the public web surface:
+# pukucloud-api (:8080, behind the ALB) + the dashboard (:3000). Does NOT run
+# Firecracker. Talks to agents over the VPC on :8081 with X-Node-Token.
+#
+# Secrets come from AWS Secrets Manager (names prefixed "${secret_prefix}-"),
+# artifacts from S3 or an https:// bundle URL. Terraform renders:
+#   region           - AWS region label
+#   secret_prefix    - Secrets Manager name prefix
+#   edge_binary_url  - https:// or s3:// URL of the edge bundle (tar.gz with
+#                      bin/pukucloud-api and optionally dashboard/)
+#   dashboard_bucket - S3 bucket holding bin/pukucloud-api + dashboard/
+#                      (used when edge_binary_url is empty)
+#   zone_name        - public DNS zone (api.<zone>, app.<zone>)
+set -euo pipefail
+exec > >(tee -a /var/log/pukucloud-cloud-init.log) 2>&1
+export DEBIAN_FRONTEND=noninteractive
+
+REGION="${region}"
+SECRET_PREFIX="${secret_prefix}"
+EDGE_BINARY_URL="${edge_binary_url}"
+DASHBOARD_BUCKET="${dashboard_bucket}"
+ZONE_NAME="${zone_name}"
+
+for _ in $(seq 1 120); do
+  if ! fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock >/dev/null 2>&1; then
+    break
+  fi
+  sleep 5
+done
+
+apt-get update
+apt-get install -y ca-certificates curl wget jq unzip iproute2
+
+if ! command -v aws >/dev/null 2>&1; then
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+  unzip -q /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install --update
+  rm -rf /tmp/aws /tmp/awscliv2.zip
+fi
+export AWS_DEFAULT_REGION="$REGION"
+
+# Node.js 22 for the dashboard SSR server.
+if ! command -v node >/dev/null 2>&1 || ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 20 ? 0 : 1)' >/dev/null 2>&1; then
+  curl -fsSL https://deb.nodesource.com/setup_22.x -o /usr/local/src/nodesource_setup_22.x
+  bash /usr/local/src/nodesource_setup_22.x
+  apt-get install -y nodejs
+fi
+
+secret() {
+  aws secretsmanager get-secret-value --secret-id "$1" --query SecretString --output text 2>/dev/null || true
+}
+NODE_TOKEN="$(secret "$${SECRET_PREFIX}-node-token")"
+DATABASE_URL="$(secret "$${SECRET_PREFIX}-database-url")"
+CLICKHOUSE_URL="$(secret "$${SECRET_PREFIX}-clickhouse-url")"
+SUPABASE_JSON="$(secret "$${SECRET_PREFIX}-supabase")"
+SUPABASE_URL="$(printf '%s' "$SUPABASE_JSON" | jq -r '.supabase_url // ""' 2>/dev/null || true)"
+SUPABASE_JWKS_URL="$(printf '%s' "$SUPABASE_JSON" | jq -r '.supabase_jwks_url // ""' 2>/dev/null || true)"
+SUPABASE_ANON_KEY="$(printf '%s' "$SUPABASE_JSON" | jq -r '.supabase_anon_key // ""' 2>/dev/null || true)"
+: "$${NODE_TOKEN:?node-token secret is empty}"
+: "$${DATABASE_URL:?database-url secret is empty (rds.tf writes it)}"
+: "$${ZONE_NAME:?zone_name is required (var.cloudflare_zone_name)}"
+
+install -d -m 0755 /var/lib/pukucloud /etc/pukucloud /opt/pukucloud-dashboard /opt/pukucloud-bin
+
+# ── Pull the API binary + dashboard ───────────────────────────────────────────
+# Bundle layout: bin/pukucloud-api, dashboard/ (next standalone output).
+fetch() {
+  case "$1" in
+    s3://*) aws s3 cp "$1" "$2" ;;
+    *)      curl -fsSL "$1" -o "$2" ;;
+  esac
+}
+if [ -n "$EDGE_BINARY_URL" ]; then
+  fetch "$EDGE_BINARY_URL" /var/lib/pukucloud/edge-bundle.tgz
+  tar -xzf /var/lib/pukucloud/edge-bundle.tgz -C /opt/pukucloud-bin
+  install -m 0755 /opt/pukucloud-bin/bin/pukucloud-api /usr/local/bin/pukucloud-api
+  if [ -d /opt/pukucloud-bin/dashboard ]; then
+    cp -rT /opt/pukucloud-bin/dashboard /opt/pukucloud-dashboard 2>/dev/null || true
+  fi
+elif [ -n "$DASHBOARD_BUCKET" ]; then
+  aws s3 cp "s3://$DASHBOARD_BUCKET/bin/pukucloud-api" /usr/local/bin/pukucloud-api || true
+  chmod 0755 /usr/local/bin/pukucloud-api 2>/dev/null || true
+  aws s3 sync "s3://$DASHBOARD_BUCKET/dashboard/" /opt/pukucloud-dashboard/ || true
+fi
+[ -x /usr/local/bin/pukucloud-api ] || echo "WARN: /usr/local/bin/pukucloud-api missing — set edge_binary_url or dashboard_bucket, or bake it into the AMI"
+
+# ── Environment ───────────────────────────────────────────────────────────────
+ENV_API_NEXT="/etc/pukucloud/env.api.next.$$"
+cat > "$ENV_API_NEXT" <<EOF
+PUKUCLOUD_DB_DRIVER=pgx
+PUKUCLOUD_DB_DSN=$${DATABASE_URL}
+PUKUCLOUD_NODE_TOKEN=$${NODE_TOKEN}
+PUKUCLOUD_REGION=$${REGION}
+PUKUCLOUD_AUTH_MODE=jwt
+SUPABASE_JWKS_URL=$${SUPABASE_JWKS_URL}
+SUPABASE_ISSUER=
+SUPABASE_AUDIENCE=authenticated
+CLICKHOUSE_URL=$${CLICKHOUSE_URL}
+PUKUCLOUD_CLICKHOUSE_URL=$${CLICKHOUSE_URL}
+PUKUCLOUD_DASHBOARD_URL=https://app.$${ZONE_NAME}
+EOF
+install -m 0600 -o root -g root "$ENV_API_NEXT" /etc/pukucloud/env.api
+rm -f "$ENV_API_NEXT"
+
+cat > /etc/pukucloud/env.dashboard <<EOF
+NEXT_PUBLIC_SUPABASE_URL=$${SUPABASE_URL}
+NEXT_PUBLIC_SUPABASE_ANON_KEY=$${SUPABASE_ANON_KEY}
+NEXT_PUBLIC_API_BASE=https://api.$${ZONE_NAME}
+PORT=3000
+EOF
+chmod 0644 /etc/pukucloud/env.dashboard
+
+cat > /etc/systemd/system/pukucloud-api.service <<'UNIT'
+[Unit]
+Description=PukuCloud public API (multi-node edge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/pukucloud/env.api
+ExecStart=/usr/local/bin/pukucloud-api -addr :8080 -token-file /var/lib/pukucloud/tokens.json
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /etc/systemd/system/pukucloud-dashboard.service <<'UNIT'
+[Unit]
+Description=PukuCloud dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/pukucloud/env.dashboard
+WorkingDirectory=/opt/pukucloud-dashboard
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# The ALB forwards to :8080 only, where pukucloud-api serves /v1 + /healthz
+# directly (the same shape as the GCP LB → edge :8080 path). The dashboard on
+# :3000 is not exposed through the ALB here; production serves it from a
+# static host (Cloudflare Pages). No caddy on this tier.
+systemctl daemon-reload
+systemctl enable --now pukucloud-api || true
+if [ -f /opt/pukucloud-dashboard/server.js ]; then
+  systemctl enable --now pukucloud-dashboard || true
+fi
+
+echo "edge cloud-init done at $(date -u)"

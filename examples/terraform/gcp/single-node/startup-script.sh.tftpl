@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PUKUCLOUD_CONTROL_PLANE_URL='${control_plane_url}'
+export PUKUCLOUD_NODE_TOKEN='${node_token}'
+
+apt-get update
+apt-get install -y curl ca-certificates jq linux-tools-common
+
+install -d -m 0755 /opt/pukucloud
+cat >/opt/pukucloud/agent.env <<ENV
+PUKUCLOUD_CONTROL_PLANE_URL=${control_plane_url}
+PUKUCLOUD_NODE_TOKEN=${node_token}
+ENV
+chmod 0600 /opt/pukucloud/agent.env
+
+# Replace this placeholder with a pinned release artifact once published.
+curl -fsSL https://raw.githubusercontent.com/pukucloud-io/pukucloud-ai/main/scripts/install-agent.sh | bash || true
+
+systemctl enable --now pukucloud-agent || true

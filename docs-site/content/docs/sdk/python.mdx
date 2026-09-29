@@ -1,0 +1,270 @@
+---
+title: Python SDK
+description: pukucloud — the official Python SDK. Full reference.
+---
+
+The `pukucloud` package is the recommended way to use PukuCloud from Python. It targets 3.9+, has no required dependencies beyond `requests`, and mirrors the [REST API](/docs/reference/rest-api) 1:1.
+
+## Install
+
+```bash
+pip install pukucloud
+```
+
+## Configure
+
+Two env vars:
+
+```bash
+export PUKUCLOUD_API_KEY=pds_abc123def456...
+export PUKUCLOUD_API=https://api.pukucloud.ai   # optional, this is the default
+```
+
+The SDK also reads `~/.config/pukucloud/config.json` (`token` / `apiKey` / `api_key`) if no env vars are set — useful for shared dev workstations.
+
+## Imports
+
+```python
+from pukucloud import (
+    Client, Sandbox, ExecResult,
+    Template, TemplateBuild,
+    Token,
+    PukuCloudError, AuthError, NotFoundError,
+    BadRequestError, ServerError, APIConnectionError,
+)
+```
+
+The most common surface is `Sandbox` — a class with classmethod constructors and rich instance methods. Under the hood every call goes through a singleton `Client`, but you rarely instantiate one yourself.
+
+## Sandboxes
+
+### `Sandbox.create(**opts) -> Sandbox`
+
+| Arg              | Type                | Default            | Notes                                                  |
+| ---------------- | ------------------- | ------------------ | ------------------------------------------------------ |
+| `template`       | `str`               | `"ubuntu-24.04"`   | Any [official template](/docs/concepts/templates) or your own. CPU and memory are baked into the template. |
+| `from_snapshot`  | `str?`              | —                  | Boot from this snapshot ID instead of the template default. |
+| `ttl_seconds`    | `int?`              | server default (3600) | Wall-clock lifetime.                                 |
+| `persistent`     | `bool?`             | `False`            | If `True`, ignores TTL but is hibernated when idle.    |
+| `metadata`       | `dict[str,str]?`    | —                  | Free-form tags for filtering / auditing.               |
+| `volumes`        | `list[dict]?`       | —                  | `[{"name": "data", "read_only": True}]`                |
+
+<Callout type="warn">
+  `cpu` and `memory_mb` keyword arguments are accepted for backwards compatibility but **deprecated and ignored** — the server always uses the template's baked size. Passing them emits a `DeprecationWarning`. To run at a different size, [bake a custom template](/docs/concepts/templates#bake-your-own) with `--cpu` / `--memory-mb`.
+</Callout>
+
+Returns a `Sandbox` instance with `.id`, `.template`, `.status`, `.boot_ms`, `.boot_mode`, `.guest_ip`, `.metadata`, `.created_at`.
+
+### `Sandbox.list() -> list[Sandbox]`
+
+```python
+for s in Sandbox.list():
+    print(s.id, s.status, s.template)
+```
+
+### `Sandbox.get(id) -> Sandbox`
+
+```python
+s = Sandbox.get("278a4f42-3467-4424-98e6-a547646dd0fd")
+```
+
+## Sandbox instance methods
+
+### Exec & code
+
+```python
+result = sandbox.exec("python3 -c 'print(2+2)'", timeout_seconds=10)
+# ExecResult(stdout='4\n', stderr='', exit_code=0, duration_ms=23)
+
+shell  = sandbox.run_code("ls -la", language="shell")
+python = sandbox.run_code("import sys; print(sys.version)", language="python")
+```
+
+`cmd` is a **string**, not a list — it runs under `sh -c`. See [Exec](/docs/concepts/exec) for the full guide.
+
+### Streaming logs
+
+```python
+for line in sandbox.logs(stream="both", follow=True):
+    print(line)
+```
+
+`stream` ∈ `"stdout"|"stderr"|"both"`. `follow=True` opens an SSE stream until you `break` or the sandbox exits.
+
+### Filesystem
+
+```python
+sandbox.filesystem.write("/workspace/in.txt", "hi\n")
+data = sandbox.filesystem.read("/workspace/in.txt")     # bytes
+sandbox.filesystem.upload("./local.csv", "/workspace/data.csv")
+sandbox.filesystem.download("/workspace/out.csv", "./out.csv")
+```
+
+Full guide: [Filesystem](/docs/concepts/filesystem).
+
+### Lifecycle
+
+```python
+sandbox.pause()
+sandbox.resume()
+
+snap = sandbox.snapshot()           # snapshot ID string
+fork = sandbox.fork(metadata={"branch": "exp"})
+many = sandbox.fork_tree(count=8, metadata={"batch": "search"})
+fork.promote()                      # detach from parent
+
+sandbox.hibernate()
+sandbox.wake()
+
+sandbox.set_ttl(7200)
+sandbox.set_persistent(True)
+sandbox.lifecycle()                 # {"ttl_seconds":7200,"persistent":True,"idle_seconds":12}
+
+sandbox.kill()
+```
+
+### Preview URLs
+
+```python
+sandbox.preview_url(3000)                              # public, format-only
+sandbox.preview_urls()                                 # {3000: "https://3000-…"}
+sandbox.signed_preview_url(3000, ttl_seconds=3600)     # {"url":..., "token":..., "expires_at":...}
+```
+
+Full guide: [Preview URLs](/docs/concepts/preview-urls).
+
+### Context manager
+
+```python
+with Sandbox.create(template="code-interpreter") as sb:
+    sb.exec("python3 train.py")
+# sb.kill() called automatically
+```
+
+## Templates
+
+```python
+from pukucloud import Client
+client = Client()
+
+client.templates.list()
+client.templates.get("code-interpreter")
+client.templates.delete("my-template")
+
+build = client.templates.build(
+    name="my-template",
+    rootfs=open("Dockerfile.tar", "rb"),
+    size_mb=2048,
+)
+print(build.id, build.status)
+
+client.templates.builds()
+client.templates.get_build(build.id)
+```
+
+`Template` has `.name`, `.rootfs_path`, `.size_bytes`, `.meta`. `TemplateBuild` has `.id`, `.name`, `.status`, `.error`, `.started_at`, `.ended_at`, `.size_mb`, `.bytes`.
+
+## Databases
+
+Managed PostgreSQL 16 in dedicated Firecracker microVMs (Beta). See [Databases](/docs/concepts/databases).
+
+```python
+from pukucloud import Client
+client = Client()
+
+# Create — blocks until Postgres is accepting connections (~30–90s)
+db = client.databases.create(label="my-app-db")   # size is fixed by the postgres-16 template
+print(db["connection_url"])                         # postgres://...
+
+client.databases.list()                             # metadata only (no credentials)
+client.databases.get(db["id"])                      # full record incl. connection_url
+client.databases.connection(db["id"])               # {connection_url, broker_url, broker_token}
+client.databases.delete(db["id"])                   # irreversible
+```
+
+Connect with any driver using `connection_url` (TLS required):
+
+```python
+import psycopg
+with psycopg.connect(db["connection_url"] + "?sslmode=require") as conn:
+    print(conn.execute("SELECT version()").fetchone())
+```
+
+## Volumes
+
+Persistent named volumes — ext4 block devices that survive sandbox deletion and attach at create time. See [Volumes](/docs/concepts/volumes).
+
+```python
+from pukucloud import Client, Sandbox
+client = Client()
+
+vol = client.volumes.create(name="models", size_mb=4096)
+client.volumes.list()              # [{"name": "models", "size_mb": 4096, ...}]
+client.volumes.get("models")
+client.volumes.delete("models")    # refused (409) while attached to a running sandbox
+
+# Attach at create — appears as /dev/vdb (then vdc, ...) inside the guest
+sb = Sandbox.create(
+    template="code-interpreter",
+    volumes=[{"name": "models", "read_only": True}, {"name": "scratch"}],
+)
+sb.exec("mkdir -p /mnt/models && mount -o ro /dev/vdb /mnt/models")
+```
+
+There is no volume count or storage quota — the open-source edition is unmetered. A hard **64 GiB per-volume ceiling** applies, and a host with no free space returns 507. See [Volumes](/docs/concepts/volumes).
+
+## Tokens
+
+```python
+client.tokens.list()
+new = client.tokens.create("ci-pipeline", expires_in_days=30)
+print(new.token)            # only visible once
+client.tokens.revoke(new.prefix)
+```
+
+## Errors
+
+All SDK exceptions inherit from `PukuCloudError`:
+
+| Class                  | When                                                                |
+| ---------------------- | ------------------------------------------------------------------- |
+| `AuthError`            | 401 / 403 — missing or invalid token.                               |
+| `NotFoundError`        | 404 — sandbox / template / snapshot doesn't exist.                  |
+| `BadRequestError`      | 4xx other — bad payload, validation failure, rate-limit guard.      |
+| `ServerError`          | 5xx — orchestrator hiccup, transient — usually safe to retry.       |
+| `APIConnectionError`   | Underlying `requests` connection problem.                            |
+
+All carry `.status_code` and `.response` for diagnostics.
+
+```python
+try:
+    sandbox = Sandbox.get(some_id)
+except NotFoundError:
+    sandbox = Sandbox.create(template="code-interpreter")
+```
+
+## Custom client
+
+Most apps work with the implicit singleton client. Override when you need a non-default base URL or token:
+
+```python
+from pukucloud import Client
+
+client = Client(api_url="https://api.staging.pukucloud.ai", token="pds_test_…")
+
+sandbox = client.sandboxes.create(template="code-interpreter")
+client.sandboxes.list()
+client.sandboxes.get(sandbox.id)
+client.sandboxes.fork(sandbox.id, metadata={"x": "y"})
+client.sandboxes.fork_tree(sandbox.id, count=4)
+client.sandboxes.promote(sandbox.id)
+client.sandboxes.delete(sandbox.id)
+
+client.me()                  # whoami — returns the org / user / scopes
+```
+
+`Sandbox.create(...)` is sugar for `Client._global().sandboxes.create(...)`.
+
+## Async support
+
+The current SDK is synchronous (built on `requests`). For high-concurrency workloads, run it in a thread pool (`asyncio.to_thread`) or use the [REST API](/docs/reference/rest-api) directly with `httpx`. An `async` SDK is on the roadmap — track [GitHub issues](https://github.com/pukucloud/pukucloud/issues).

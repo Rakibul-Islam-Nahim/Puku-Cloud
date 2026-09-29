@@ -1,0 +1,195 @@
+---
+title: REST API
+description: All PukuCloud HTTP endpoints, indexed.
+---
+
+Base URL for the hosted API:
+
+```text
+https://api.pukucloud.ai
+```
+
+Token-based requests use `Authorization: Bearer $PUKUCLOUD_API_KEY`. Token examples use the `pds_` prefix.
+
+## Public
+
+```http
+GET /healthz
+GET /version
+GET /metrics
+```
+
+## Auth and tokens
+
+JWT-only endpoints:
+
+```http
+GET /v1/me
+POST /v1/me/current-org
+POST /v1/me/tokens
+GET /v1/me/tokens
+DELETE /v1/me/tokens/{prefix}
+```
+
+## Sandboxes
+
+Token or JWT:
+
+```http
+POST /v1/sandboxes
+GET /v1/sandboxes
+GET /v1/sandboxes/{id}
+DELETE /v1/sandboxes/{id}
+```
+
+Create body — only `template` is required. CPU and memory come from the template's baked size and are **not** accepted in this payload (older clients may send them; they will be ignored and reflected back as the template's actual size).
+
+```json
+{
+  "template": "code-interpreter",
+  "ttl_seconds": 3600,
+  "metadata": { "job": "example" }
+}
+```
+
+## Sandbox operations
+
+All operations are proxied to the agent:
+
+```http
+POST /v1/sandboxes/{id}/exec
+POST /v1/sandboxes/{id}/exec/stream
+GET /v1/sandboxes/{id}/exec/pty
+GET /v1/sandboxes/{id}/exec/ws
+GET /v1/sandboxes/{id}/logs
+GET /v1/sandboxes/{id}/events
+GET /v1/sandboxes/{id}/lsp/{lang}
+```
+
+`/exec/stream` and `/events` use Server-Sent Events. `/exec/pty`, `/exec/ws`, and `/lsp/{lang}` upgrade to WebSocket.
+
+## Filesystem
+
+```http
+GET /v1/sandboxes/{id}/fs?path=/workspace/app.py
+PUT /v1/sandboxes/{id}/fs?path=/workspace/app.py
+DELETE /v1/sandboxes/{id}/fs?path=/workspace/app.py
+GET /v1/sandboxes/{id}/fs/dir?path=/workspace
+GET /v1/sandboxes/{id}/fs/stat?path=/workspace/app.py
+```
+
+There are no `/files` or `/files/ls` routes.
+
+## Lifecycle
+
+```http
+POST /v1/sandboxes/{id}/pause
+POST /v1/sandboxes/{id}/resume
+POST /v1/sandboxes/{id}/snapshots
+POST /v1/sandboxes/{id}/fork
+POST /v1/sandboxes/{id}/fork-tree
+POST /v1/sandboxes/{id}/promote
+POST /v1/sandboxes/{id}/hibernate
+POST /v1/sandboxes/{id}/wake
+GET /v1/sandboxes/{id}/lifecycle
+PATCH /v1/sandboxes/{id}/lifecycle
+```
+
+## Preview
+
+```http
+POST /v1/sandboxes/{id}/preview
+POST /v1/sandboxes/{id}/preview-token
+```
+
+`/preview` requires JWT auth. `/preview-token` accepts token or JWT auth.
+
+## Templates
+
+```http
+GET /v1/templates
+GET /v1/templates/{name}
+POST /v1/templates/build
+DELETE /v1/templates/{name}
+GET /v1/templates/{name}/builds
+GET /v1/builds/{id}
+```
+
+## Ports
+
+```http
+GET /v1/sandboxes/{id}/ports
+POST /v1/sandboxes/{id}/ports
+DELETE /v1/sandboxes/{id}/ports
+```
+
+## Databases
+
+Managed PostgreSQL 16 (Beta). See [Databases](/docs/concepts/databases).
+
+```http
+POST   /v1/databases
+GET    /v1/databases
+GET    /v1/databases/{id}
+PATCH  /v1/databases/{id}
+DELETE /v1/databases/{id}
+GET    /v1/databases/{id}/connection
+GET    /v1/databases/{id}/stats
+GET    /v1/databases/{id}/logs
+GET    /v1/databases/{id}/metrics
+POST   /v1/databases/{id}/failover
+POST   /v1/databases/{id}/reset-credentials
+POST   /v1/databases/{id}/wake
+ANY    /v1/databases/{id}/proxy/{path}
+```
+
+`PATCH` updates `always_on` (see [idle auto-suspend](/docs/concepts/databases#idle-auto-suspend)).
+`failover` and `reset-credentials` require a multi-node deployment and return
+`501` otherwise. Database branching, cloning, point-in-time restore, and the
+connection allow list are [PukuCloud Cloud features](/docs/concepts/open-source-vs-cloud)
+and are not part of this API surface.
+
+Create body (`label` optional):
+
+```json
+{
+  "label": "my-app-db"
+}
+```
+
+CPU and memory are fixed by the `postgres-16` template (2 vCPU · 1 GiB RAM, baked into its snapshot) and can't be set per-database.
+
+`POST` returns `201` and blocks until PostgreSQL is ready (up to 90s). The body includes `connection_url`, `host`, `port`, `database`, `username`, `password`, `broker_token`, and `broker_url`. `DELETE` returns `204` and is irreversible. The `proxy` route forwards to the in-VM REST query broker; authenticate it with `Authorization: Bearer <broker_token>`.
+
+## Volumes
+
+Durable per-workspace block storage that survives sandbox lifecycles. See [Volumes](/docs/concepts/volumes).
+
+```http
+POST   /v1/volumes
+GET    /v1/volumes
+GET    /v1/volumes/{name}
+DELETE /v1/volumes/{name}
+```
+
+Create body — `name` is required, `size_mb` optional (defaults to 256 MiB, hard ceiling 65536 MiB / 64 GiB):
+
+```json
+{
+  "name": "my-data",
+  "size_mb": 1024
+}
+```
+
+A host with no storage headroom returns `507`. A volume is host-pinned to the agent that creates it for its lifetime. Listing is per-agent (it queries the scheduler-picked agent), so a volume created on one agent may not appear in a list served by another until a control-plane volume registry exists.
+
+## Metrics
+
+```http
+GET /v1/metrics/overview
+GET /v1/metrics/sandbox/{id}
+```
+
+Backed by ClickHouse. When `PUKUCLOUD_CLICKHOUSE_URL` is unset, these return
+`503` and the rest of the API is unaffected. See
+[Observability](/docs/concepts/observability).

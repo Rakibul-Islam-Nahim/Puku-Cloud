@@ -1,0 +1,68 @@
+---
+# ─────────────────────────── Connection ────────────────────────────────────
+# Force the OpenSSH connection plugin: it honours the IAP ProxyCommand below.
+# (paramiko ignores ssh -o ProxyCommand and would try to resolve the instance
+# name via DNS, which fails — agents have no public DNS/IP.)
+ansible_connection: ssh
+# SSH login user + key are the same ones `gcloud compute ssh` provisions into
+# instance metadata (confirmed via `gcloud compute ssh --dry-run`).
+ansible_user: ajaykumar
+ansible_ssh_private_key_file: "{{ lookup('env', 'HOME') }}/.ssh/google_compute_engine"
+
+# Tunnel every SSH connection through IAP. `%h`/`%p` are the instance name and
+# port; the 3rd arg is the per-host zone surfaced by the inventory (compose).
+# StrictHostKeyChecking is off because agent VMs are ephemeral (autoscaled /
+# recreated) so their host keys legitimately change — IAP + our key already
+# provide the trust boundary.
+ansible_ssh_common_args: >-
+  -o IdentitiesOnly=yes
+  -o StrictHostKeyChecking=no
+  -o UserKnownHostsFile=/dev/null
+  -o ProxyCommand="{{ playbook_dir }}/iap-proxy.sh %h %p {{ pukucloud_zone | default('') }}"
+
+# ─────────────────────────── Project / GCS ─────────────────────────────────
+gcp_project: REPLACE_WITH_YOUR_GCP_PROJECT_ID
+# Runtime bucket the agent VMs already read from (seeds + bin/). Matches
+# release.yml's GCS_BUCKET and cloud-init's PUKUCLOUD_GCS_BUCKET.
+agent_gcs_bucket: REPLACE_WITH_YOUR_GCS_BUCKET
+
+# ─────────────────────────── Firecracker ───────────────────────────────────
+firecracker_version: "1.16.0"
+firecracker_arch: x86_64
+
+# ─────────────────────────── Agent binary ──────────────────────────────────
+agent_gcs_object: bin/pukucloud-agent
+agent_bin_path: /usr/local/bin/pukucloud-agent
+agent_service: pukucloud-agent
+# Restart the service after swapping the binary. Safe for running sandboxes:
+# the unit is KillMode=mixed, so SIGTERM hits ONLY the agent PID — Firecracker
+# children keep running across the restart.
+agent_restart_on_change: true
+
+# ─────────────────────────── Managed env knobs ─────────────────────────────
+# agent_env manages ONLY these fleet-wide, non-secret knobs in env.agent.
+# Secret + per-host keys (DB_DSN, NODE_TOKEN, SHARED_KEY, *CLICKHOUSE_URL,
+# SUPABASE_JWKS_URL, AGENT_ID, NATID_SLOT, INTERNAL_IP, ZONE, REGION, …) stay
+# owned by cloud-init and are protected by agent_env_denylist.
+agent_env_file: /etc/pukucloud/env.agent
+agent_env_managed:
+  PUKUCLOUD_STREAM_RESTORE: "1"
+  PUKUCLOUD_HUGEPAGES: "1"
+  # Squeezable class: these templates cold-boot with 4 KiB pages even on a
+  # hugepage fleet, which is what makes cgroup memory.high enforcement and
+  # mem_file_path CoW sharing work. Only templates listed here can be squeezed
+  # by the memory pressure ladder. The postgres family is deliberately absent —
+  # a managed database is the guaranteed class and must never be squeezed.
+  # Keep in sync with cloud-init/user-data-agent.sh.
+  PUKUCLOUD_NOHUGE_TEMPLATES: "base,code-interpreter,agent"
+  PUKUCLOUD_NATID: "1"
+  PUKUCLOUD_NATID_POOL_SIZE: "24"
+  # Generic request-based idle sweeper. "0" disables it. Managed databases use
+  # the separate, postgres-activity-based PUKUCLOUD_DB_IDLE_AFTER_SECONDS
+  # instead, which is the right signal for long-lived-but-quiet connections.
+  PUKUCLOUD_IDLE_AFTER: "0"
+  # Vsock exec fast-path: routes the non-mux guest ops (exec + fs) to the
+  # in-guest pukucloud-daemon over AF_VSOCK instead of a fresh SSH connection
+  # per call. SSH stays the automatic per-op fallback, so worst case this is a
+  # no-op. Requires the daemon baked into your snapshots — leave "0" until then.
+  PUKUCLOUD_VSOCK_EXEC: "0"

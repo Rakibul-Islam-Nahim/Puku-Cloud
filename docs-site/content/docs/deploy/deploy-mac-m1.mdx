@@ -1,0 +1,35 @@
+---
+title: Deploy on Mac (M1/M2/M3)
+description: Local dev on Apple Silicon via Lima — for hacking on PukuCloud itself.
+---
+
+Apple Silicon Macs are useful for local PukuCloud development. Build the CLI from source and point it at the API you are running.
+
+## Build the CLI
+
+```bash
+git clone https://github.com/pukucloud/pukucloud
+cd pukucloud/cmd/pukucloud
+go build -o /usr/local/bin/pukucloud ./
+```
+
+## Configure
+
+```bash
+export PUKUCLOUD_API=https://api.pukucloud.ai
+export PUKUCLOUD_API_KEY=pds_abc123def456...
+```
+
+Use your local API origin instead of `https://api.pukucloud.ai` when developing against a local control plane.
+
+## Smoke test
+
+```bash
+pukucloud version
+pukucloud template list
+pukucloud sandbox create --template base --ttl 1h
+pukucloud sandbox exec <id> -- uname -a
+pukucloud sandbox delete <id>
+```
+
+The current CLI command tree is `auth`, `template`, `sandbox`, `token`, `version`, and `help`; it does not include a Mac-specific deploy command.
