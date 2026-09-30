@@ -11,6 +11,7 @@ This directory contains GitHub-rendered documentation for self-hosting, operatin
 | Deploy the control plane on Cloudflare Workers | [setup-control-plane-cloudflare.md](setup-control-plane-cloudflare.md) |
 | Deploy a multi-node fleet on AWS | [setup-self-host-aws.md](setup-self-host-aws.md) |
 | Deploy a multi-node fleet on GCP | [setup-self-host-gcp.md](setup-self-host-gcp.md) |
+| Operate a multi-node fleet (add/remove a node, pools, scheduler, leases) | [multi-node.md](multi-node.md) |
 | Understand how the pieces fit together | [architecture.md](architecture.md) |
 | Find my way around the repo | [repo-layout.md](repo-layout.md) |
 | Build or update a global template image | [bake-global-templates.md](bake-global-templates.md) |
@@ -26,6 +27,7 @@ This directory contains GitHub-rendered documentation for self-hosting, operatin
 - [setup-control-plane-cloudflare.md](setup-control-plane-cloudflare.md) — control plane on Cloudflare Workers, agents anywhere.
 - [setup-self-host-aws.md](setup-self-host-aws.md) — full multi-node fleet on AWS via Terraform.
 - [setup-self-host-gcp.md](setup-self-host-gcp.md) — full multi-node fleet on GCP via Terraform.
+- [multi-node.md](multi-node.md) — operator walkthrough: agent registration, scheduler, leases, pools, burst-spread, draining a node.
 
 ### Concepts & reference
 - [architecture.md](architecture.md) — control plane, data plane, workloads; how UFFD streaming, snapshot store, and the scheduler fit together.

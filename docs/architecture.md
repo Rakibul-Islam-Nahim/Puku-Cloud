@@ -145,6 +145,8 @@ A typical self-hosted AWS or GCP fleet looks like:
 
 Concrete numbers (instance sizes, costs, caveats) live in [infra/README.md](../infra/README.md). The Cloudflare Workers deployment shrinks the control plane to "just the edge" and lets you keep the same agent fleet — see [setup-control-plane-cloudflare.md](setup-control-plane-cloudflare.md).
 
+**Operator walkthrough** — how the `MultiNodeDirector` picks an agent, how heartbeats and leases work, how to add or drain a node, the burst-spread mechanism, and the known gaps — lives in [multi-node.md](multi-node.md).
+
 ---
 
 ## Auth boundaries
