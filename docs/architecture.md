@@ -11,10 +11,121 @@ How PukuCloud fits together: the control plane, the data plane, and the workload
 - [Snapshot pipeline](#snapshot-pipeline)
 - [UFFD memory streaming](#uffd-memory-streaming)
 - [Demand-paged rootfs](#demand-paged-rootfs)
-- [Scheduler](#scheduler)
+- [Orchestration: Temporal + Sentry + D1 + DO](#orchestration-temporal--sentry--d1--do)
 - [Multi-node topology](#multi-node-topology)
 - [Auth boundaries](#auth-boundaries)
 - [Where each layer lives in this repo](#where-each-layer-lives-in-this-repo)
+
+---
+
+## Orchestration: Temporal + Sentry + D1 + DO
+
+The control plane and the data plane are decoupled through a workflow
+orchestrator (Temporal). The controller never addresses workers by IP.
+Adding capacity is "start more workers on more hosts" — the controller
+sees no code change.
+
+```
+   ┌────────────────────────────────────────────────────────────────┐
+   │                      Cloudflare Edge                            │
+   │                                                                │
+   │  ┌──────────────┐         ┌──────────────────┐                 │
+   │  │  Controller  │────────►│ Temporal Cloud   │ ◄──┐            │
+   │  │  (Worker)    │         │ (or self-hosted)  │    │            │
+   │  │              │         │                   │    │            │
+   │  │  ├─ D1       │         └──────────────────┘    │            │
+   │  │  │  history  │                                 │            │
+   │  │  ├─ DO       │                                 │            │
+   │  │  │  live     │                                 │            │
+   │  │  ├─ R2       │                                 │            │
+   │  │  │  snapshot │         ┌──────────────────┐    │            │
+   │  │  └─ Sentry   │────────►│ Sentry           │    │            │
+   │  │              │         │ (self-hosted)    │    │            │
+   │  └──────────────┘         └──────────────────┘    │            │
+   └───────────────────────────────────────────────────┼────────────┘
+                                                       │
+                          (outbound gRPC + heartbeats) │
+                                                       │
+            ┌──────────────────────────────────────────┼──────────┐
+            │                                          │          │
+       ┌────┴─────┐                              ┌─────┴────┐     │
+       │ Agent    │                              │ Agent    │ ... │
+       │ Go       │                              │ Go       │     │
+       │ bare     │                              │ bare     │     │
+       │ metal    │                              │ metal    │     │
+       │          │                              │          │     │
+       │ Firecracker                             │ Firecracker   │
+       │ UFFD    │                              │ UFFD    │     │
+       │ NBD     │                              │ NBD     │     │
+       │ +Temporal│                              │ +Temporal│     │
+       │  worker  │                              │  worker │     │
+       └─────────┘                              └─────────┘     │
+       ▲                                                              │
+       │      (legacy: agent HTTP API for /exec, /filesystem, etc.) │
+       └─────────────────────────────────────────────────────────────┘
+```
+
+### How a request flows
+
+1. Dashboard → `POST /v1/sandboxes` on the CF Worker controller.
+2. Controller validates, writes a "queued" row to D1, then calls
+   Temporal's `StartWorkflow` for `LaunchMicroVMWorkflow` with a stable
+   workflow ID.
+3. Temporal's frontend dispatches the workflow's first activity
+   (`LaunchMicroVM`) to the next available worker on the task queue.
+4. The worker calls Firecracker / UFFD / NBD, heartbeats every 10s,
+   and updates its Durable Object with live state (status, capacity).
+5. On completion, the worker writes a final record to D1 and signals
+   the workflow complete.
+6. The dashboard polls `GET /v1/sandboxes/{workflowId}`; the controller
+   serves it from D1 (history) + Temporal (live status) + DO (capacity).
+
+### Components
+
+| Component | Where | Purpose | Replaces |
+|-----------|-------|---------|----------|
+| **Temporal** | Self-hosted (or Temporal Cloud) | Workflow orchestration, retries, timeouts, leases | Old PostgreSQL scheduler, custom multi-node director |
+| **Sentry** | Self-hosted | Error tracking, traces, release health | In-house ClickHouse-only observability |
+| **D1** | Cloudflare | Durable history (workflows, audit log, tokens) | Old PostgreSQL control-plane DB |
+| **Durable Objects** | Cloudflare | Per-agent live state (capacity, current VM) | Old in-Postgres heartbeats table |
+| **R2** | Cloudflare | Snapshot, template, UFFD/NBD object store | (unchanged) |
+
+### Adding capacity
+
+```bash
+# On a new bare-metal host:
+TEMPORAL_ADDRESS=temporal.example.com:7233 ./agent
+```
+
+That's it. The new host polls Temporal for activities. No controller
+re-deploy. No IP allowlist update. No load-balancer config.
+
+### Removing capacity
+
+Drain in two steps:
+
+1. Send `SIGTERM` to the agent. It drains in-flight activities, then exits.
+2. Temporal re-routes any pending workflows to other workers.
+
+No graceful drain UI needed; Temporal handles the handoff.
+
+### Why no PostgreSQL
+
+The new architecture removes the control-plane PostgreSQL dependency.
+State that used to live there is split:
+
+| Old PG table | New location |
+|--------------|--------------|
+| `sandboxes` | D1 `workflows` (history) + DO (live) |
+| `tokens`    | D1 `tokens` (history) |
+| `audit_log` | D1 `audit_log` (history) |
+| `multi-node leases` | Temporal activity leases |
+| `schedules` | Temporal schedules |
+
+The data-plane PostgreSQL instances (Temporal's own, Sentry's own)
+remain — they are infrastructure, not application state.
+
+---
 
 ---
 
@@ -125,15 +236,18 @@ Net effect: a cold agent can boot any template without first downloading the ent
 
 ---
 
-## Scheduler
+## Orchestrator
 
-The scheduler lives in the control plane (Go: `api/internal/scheduler/`, Workers: a thin shim in front of D1 + a stable-hash agent pick). It does three things:
+Workflow orchestration is handled by Temporal. The agent polls a task
+queue and executes activities (`LaunchMicroVM`, `PauseMicroVM`, etc.).
+Workflows are crash-safe: if an agent dies mid-launch, Temporal re-routes
+the activity to another agent.
 
-1. **Heartbeats.** Agents register their capacity (CPU, RAM, disk), and the scheduler stores lease state.
-2. **Scoring.** On a create request, the scheduler filters out hosts that are unhealthy, full, or missing the requested template's seed, then scores the rest by capacity headroom.
-3. **Leases.** When a host picks a sandbox to boot, it holds a short lease; if the lease expires (network partition, host death), the sandbox is reaped and the next create can land there.
-
-The Go API ships a full implementation; the Workers deployment uses a simpler stable-hash agent pick — adequate while you have a small fleet, not adequate for hundreds of agents. See the `internal/scheduler/` package and the audit in [setup-control-plane-cloudflare.md](setup-control-plane-cloudflare.md) for the production-grade gap list.
+The previous Go scheduler (`api/internal/scheduler/`) and the
+`MultiNodeDirector` are deprecated. They were replaced by Temporal's
+built-in task queue routing and retry semantics. See
+[orchestration-temporal-sentry-d1-do](#orchestration-temporal--sentry--d1--do)
+above.
 
 ---
 
@@ -167,15 +281,22 @@ The Workers control plane forwards the user's `pds_*` token **and** the shared a
 
 | Layer | Path | Owns |
 | --- | --- | --- |
-| Control plane (Go) | [`api/`](../api) | REST handlers, scheduler, multi-node state in Postgres, audit, OpenAPI. |
-| Control plane (Workers) | [`workers/`](../workers) | TypeScript + Hono, D1 + R2 + KV bindings, agent reverse-proxy. |
-| Data plane | [`agent/`](../agent) | Firecracker SDK, slotstore, snapstore, memstream (UFFD), diskstream (NBD), templates, OCI registry. |
+| Control plane | [`workers/`](../workers) | TypeScript + Hono, D1 + R2 + KV + Durable Objects bindings, Temporal client. |
+| Temporal worker | [`agent/internal/temporal/`](../agent/internal/temporal) | Workflow + activity registration, heartbeat reporting. |
+| Data plane | [`agent/`](../agent) | Firecracker SDK, slotstore, snapstore, memstream (UFFD), diskstream (NBD), templates, OCI registry, Temporal worker. |
 | Postgres tunnel | [`db-proxy/`](../db-proxy) + [`templates/postgres-16/query-broker/`](../templates/postgres-16) | SNI proxy + in-VM query broker. |
 | Templates | [`templates/`](../templates) | First-party `base` / `code-interpreter` / `agent` / `postgres-16` Dockerfiles. |
+| Self-hosted infra | [`infra/temporal/`](../infra/temporal), [`infra/sentry/`](../infra/sentry) | Temporal and Sentry docker-compose stacks. |
 | Deployment | [`infra/`](../infra), [`deploy/`](../deploy), [`cloud-init/`](../cloud-init), [`ansible/`](../ansible) | Terraform envs, rolling update runbook, host provisioning. |
 | Dashboard | [`dashboard/`](../dashboard) | Next.js UI; deployed to `app.<zone>` on Cloudflare Pages. |
 | CLI | [`cmd/pukucloud/`](../cmd/pukucloud) | Stdlib-only Go CLI for sandboxes, templates, tokens. |
 | Docs | [`docs/`](../docs), [`docs-site/`](../docs-site) | GitHub-rendered (this folder) and Next.js docs site. |
+
+> The previous Go control plane ([`api/`](../api)) is deprecated. Its
+> responsibilities are split between the Cloudflare Worker (REST + D1 +
+> DO + Temporal client) and the Temporal server (orchestration). The
+> `api/` directory is kept for now to host test fixtures and is removed
+> in a follow-up commit.
 
 For per-directory ownership and reading order, see [repo-layout.md](repo-layout.md).
 

@@ -1,27 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 package store
 
-// Postgres support uses a small database/sql connector shim around pgx. The
-// rest of Store intentionally keeps SQLite-style `?` placeholders; for pgx the
-// shim rewrites them to `$1`, `$2`, ... and translates the one SQLite-only
-// upsert statement that remains in Store (`INSERT OR REPLACE ... allocations`).
+// This file previously hosted the agent's optional Postgres connector.
+// PostgreSQL has been removed from the agent's data path. The agent now
+// uses SQLite exclusively (see store.go). All multi-agent coordination
+// happens via Temporal workflow orchestration, not a shared database.
+//
+// We keep the file's exported helpers but route them to SQLite-only paths.
+// Setting PUKUCLOUD_DB_DRIVER=postgres returns a clear error at Open time.
 
 import (
-	"context"
 	"database/sql"
-	"database/sql/driver"
 	"fmt"
-	"net/url"
-	"strings"
-	"time"
 
 	"github.com/pukucloud/agent/migrations"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 )
 
+// openSQLiteDB opens the agent's local SQLite database. This is the only
+// database driver the agent supports now.
 func openSQLiteDB(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite",
 		path+"?_journal_mode=WAL&_busy_timeout=30000&_synchronous=NORMAL&_txlock=immediate")
@@ -34,193 +32,70 @@ func openSQLiteDB(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-func openPostgresDB(dsn string) (*sql.DB, error) {
-	cfg, err := pgx.ParseConfig(withSimpleProtocol(dsn))
-	if err != nil {
-		return nil, err
-	}
-	db := sql.OpenDB(rewriteConnector{connector: stdlib.GetConnector(*cfg)})
-	// Cap the pool. The agent shares one Supabase/pgbouncer instance with the
-	// API replicas and every other agent; an uncapped pool lets a fleet of
-	// agents each open dozens of connections and exhaust the shared pooler.
-	// The agent's DB access is periodic housekeeping (5s capacity pump, meters,
-	// janitor), not a request-per-connection hot path, so a small ceiling is
-	// ample and mirrors the API pool (SetMaxOpenConns(4)).
-	db.SetMaxOpenConns(4)
-	db.SetMaxIdleConns(2)
-	db.SetConnMaxIdleTime(5 * time.Minute)
-	return db, nil
-}
-
-func withSimpleProtocol(dsn string) string {
-	// simple_protocol is only needed for PgBouncer transaction pooling (Supabase
-	// pooler port 6543). Cloud SQL direct connections (port 5432) support
-	// extended protocol natively — don't force simple protocol there.
-	isPgBouncer := strings.Contains(dsn, ":6543/") || strings.Contains(dsn, ":5431/")
-	if !isPgBouncer {
-		return dsn
-	}
-	if !strings.Contains(dsn, "://") {
-		if strings.Contains(dsn, "default_query_exec_mode") {
-			return dsn
-		}
-		return strings.TrimSpace(dsn) + " default_query_exec_mode=simple_protocol"
-	}
-	u, err := url.Parse(dsn)
-	if err != nil {
-		return dsn
-	}
-	q := u.Query()
-	if q.Get("default_query_exec_mode") == "" {
-		q.Set("default_query_exec_mode", "simple_protocol")
-	}
-	u.RawQuery = q.Encode()
-	return u.String()
-}
-
-func runMigrations(driverName string, db *sql.DB) error {
-	dialect := driverName
-	if dialect == "sqlite" {
-		dialect = "sqlite3"
-	}
-	if err := goose.SetDialect(dialect); err != nil {
-		return err
-	}
-	goose.SetBaseFS(migrations.FS)
-	return goose.Up(db, normalizeDriver(driverName))
-}
-
+// RunMigrationCommand runs a goose migration command (up/down/status)
+// against the open *sql.DB. PG is rejected.
 func RunMigrationCommand(driverName string, db *sql.DB, command string) error {
-	dialect := driverName
-	if dialect == "sqlite" {
-		dialect = "sqlite3"
+	if normalizeDriver(driverName) != "sqlite" {
+		return fmt.Errorf("only sqlite is supported; driver=%q (postgres removed)", driverName)
 	}
-	if err := goose.SetDialect(dialect); err != nil {
+	if err := goose.SetDialect("sqlite3"); err != nil {
 		return err
 	}
 	goose.SetBaseFS(migrations.FS)
-	dir := normalizeDriver(driverName)
 	switch command {
 	case "up":
-		return goose.Up(db, dir)
+		return goose.Up(db, "sqlite")
 	case "down":
-		return goose.DownTo(db, dir, 0)
+		return goose.DownTo(db, "sqlite", 0)
 	case "status":
-		return goose.Status(db, dir)
+		return goose.Status(db, "sqlite")
 	default:
 		return fmt.Errorf("unknown migration command %q", command)
 	}
 }
 
+// openPostgresDB previously opened a pgx connection to a control-plane
+// Postgres. With the move to Temporal + D1 + DO, there is no shared DB
+// for the agent. Returning an error here makes any leftover config that
+// still tries PG fail loudly instead of silently doing the wrong thing.
+func openPostgresDB(dsn string) (*sql.DB, error) {
+	return nil, fmt.Errorf("postgres driver is no longer supported; agent uses SQLite. " +
+		"Multi-agent coordination now goes through Temporal (see agent/internal/temporal/). " +
+		"Remove PUKUCLOUD_DB_DRIVER=postgres from your environment.")
+}
+
+// runMigrations runs the embedded migrations against the open *sql.DB.
+// PG is rejected; only SQLite is supported.
+func runMigrations(driverName string, db *sql.DB) error {
+	if normalizeDriver(driverName) != "sqlite" {
+		return fmt.Errorf("only sqlite is supported; driver=%q (postgres removed)", driverName)
+	}
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		return err
+	}
+	goose.SetBaseFS(migrations.FS)
+	return goose.Up(db, "sqlite")
+}
+
+// OpenDBForDriver opens the SQLite database. PG returns an error.
 func OpenDBForDriver(driverName, dsn string) (*sql.DB, error) {
 	switch normalizeDriver(driverName) {
 	case "sqlite":
 		return openSQLiteDB(dsn)
 	case "postgres":
-		return openPostgresDB(dsn)
+		return nil, fmt.Errorf("postgres driver is no longer supported; use Temporal + D1 + DO")
 	default:
-		return nil, fmt.Errorf("unsupported PUKUCLOUD_DB_DRIVER %q", driverName)
+		return nil, fmt.Errorf("unsupported PUKUCLOUD_DB_DRIVER %q (only sqlite is supported)", driverName)
 	}
 }
 
 func normalizeDriver(driverName string) string {
-	switch strings.ToLower(strings.TrimSpace(driverName)) {
-	case "", "sqlite", "sqlite3":
-		return "sqlite"
+	switch driverName {
 	case "postgres", "postgresql", "pgx":
 		return "postgres"
+	case "", "sqlite", "sqlite3":
+		return "sqlite"
 	default:
-		return strings.ToLower(strings.TrimSpace(driverName))
+		return driverName
 	}
-}
-
-type rewriteConnector struct{ connector driver.Connector }
-
-func (c rewriteConnector) Connect(ctx context.Context) (driver.Conn, error) {
-	conn, err := c.connector.Connect(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return rewriteConn{Conn: conn}, nil
-}
-func (c rewriteConnector) Driver() driver.Driver { return c.connector.Driver() }
-
-type rewriteConn struct{ driver.Conn }
-
-func (c rewriteConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
-	if pc, ok := c.Conn.(driver.ConnPrepareContext); ok {
-		return pc.PrepareContext(ctx, rewritePostgresSQL(query))
-	}
-	return c.Conn.Prepare(rewritePostgresSQL(query))
-}
-func (c rewriteConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	if ex, ok := c.Conn.(driver.ExecerContext); ok {
-		return ex.ExecContext(ctx, rewritePostgresSQL(query), args)
-	}
-	return nil, driver.ErrSkip
-}
-func (c rewriteConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	if q, ok := c.Conn.(driver.QueryerContext); ok {
-		return q.QueryContext(ctx, rewritePostgresSQL(query), args)
-	}
-	return nil, driver.ErrSkip
-}
-func (c rewriteConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
-	if b, ok := c.Conn.(driver.ConnBeginTx); ok {
-		return b.BeginTx(ctx, opts)
-	}
-	return c.Conn.Begin()
-}
-func (c rewriteConn) Ping(ctx context.Context) error {
-	if p, ok := c.Conn.(driver.Pinger); ok {
-		return p.Ping(ctx)
-	}
-	return nil
-}
-func (c rewriteConn) ResetSession(ctx context.Context) error {
-	if r, ok := c.Conn.(driver.SessionResetter); ok {
-		return r.ResetSession(ctx)
-	}
-	return nil
-}
-func (c rewriteConn) IsValid() bool {
-	if v, ok := c.Conn.(driver.Validator); ok {
-		return v.IsValid()
-	}
-	return true
-}
-func (c rewriteConn) CheckNamedValue(nv *driver.NamedValue) error {
-	if chk, ok := c.Conn.(driver.NamedValueChecker); ok {
-		return chk.CheckNamedValue(nv)
-	}
-	return driver.ErrSkip
-}
-
-func rewritePostgresSQL(q string) string {
-	normalized := strings.Join(strings.Fields(q), " ")
-	if strings.HasPrefix(strings.ToUpper(normalized), "INSERT OR REPLACE INTO ALLOCATIONS") {
-		q = `INSERT INTO allocations (sandbox_id, payload) VALUES (?,?) ON CONFLICT (sandbox_id) DO UPDATE SET payload=excluded.payload`
-	} else if strings.HasPrefix(strings.ToUpper(normalized), "INSERT OR IGNORE ") {
-		q = strings.Replace(q, "INSERT OR IGNORE", "INSERT", 1) + " ON CONFLICT DO NOTHING"
-	}
-	var b strings.Builder
-	b.Grow(len(q) + 8)
-	n := 1
-	inSingle := false
-	for i := 0; i < len(q); i++ {
-		ch := q[i]
-		if ch == '\'' {
-			inSingle = !inSingle
-			b.WriteByte(ch)
-			continue
-		}
-		if ch == '?' && !inSingle {
-			b.WriteByte('$')
-			b.WriteString(fmt.Sprint(n))
-			n++
-			continue
-		}
-		b.WriteByte(ch)
-	}
-	return b.String()
 }

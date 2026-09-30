@@ -1,0 +1,74 @@
+# Self-hosted Temporal server for PukuCloud.
+#
+# This stack runs the Temporal server (frontend + history + matching + worker)
+# with its own PostgreSQL backing store. It exposes the gRPC frontend on
+# port 7233 (for workers and clients) and the HTTP API on 8233 (for the
+# web UI). No external managed Temporal Cloud required.
+#
+# Usage:
+#   cd infra/temporal
+#   docker compose up -d
+#   # check health
+#   curl http://localhost:8233/health
+#   # open UI (optional, with --profile ui)
+#   docker compose --profile ui up -d
+#
+# Tear down: docker compose down -v
+
+name: pukucloud-temporal
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pukucloud-temporal-postgres
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    volumes:
+      - temporal_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  temporal:
+    image: temporalio/auto-setup:1.22.5
+    container_name: pukucloud-temporal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB: postgresql
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+      # Auto-create the default namespace on first boot
+      TEMPORAL_CLI_DEFAULT_NAMESPACE: default
+      # Default retention for the visibility store
+      VISIBILITY_TTL: "168h"
+    ports:
+      - "7233:7233"   # gRPC frontend (workers + clients)
+      - "8233:8233"   # HTTP API (web UI)
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8233/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  temporal-ui:
+    image: temporalio/ui:2.27.0
+    container_name: pukucloud-temporal-ui
+    profiles: ["ui"]
+    depends_on:
+      - temporal
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    ports:
+      - "8080:8080"
+
+volumes:
+  temporal_pg_data:

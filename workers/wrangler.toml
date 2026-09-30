@@ -13,9 +13,25 @@ enabled = true
 PUKUCLOUD_ENV = "production"
 PUKUCLOUD_API_VERSION = "0.1.0"
 # Agents reachable from Workers — comma-separated host:port for multi-node.
+# LEGACY: kept for the temporary fallback proxy. New code talks to Temporal,
+# not directly to agents.
 PUKUCLOUD_AGENT_URLS = "https://agent-1.internal.example.com:9090,https://agent-2.internal.example.com:9090"
 # Edge entrypoint the dashboard / clients call.
 PUKUCLOUD_DASHBOARD_URL = "https://dashboard.example.com"
+
+# ---- Temporal (self-hosted) ----------------------------------------------------
+# The controller starts / signals / queries workflows here. Workers (Go agents)
+# poll Temporal for activities. There are no worker IPs in the controller.
+TEMPORAL_ADDRESS = "http://temporal:8233"
+TEMPORAL_NAMESPACE = "default"
+TEMPORAL_TASK_QUEUE = "pukucloud-microvms"
+# TEMPORAL_AUTH_TOKEN set via `wrangler secret put TEMPORAL_AUTH_TOKEN`
+
+# ---- Sentry (self-hosted) ------------------------------------------------------
+# SENTRY_DSN set via `wrangler secret put SENTRY_DSN`
+# Format: https://<public_key>@<host>/<project_id>
+# Example for self-hosted Sentry at https://sentry.example.com project 1:
+#   SENTRY_DSN = "https://abc123@sentry.example.com/1"
 
 # ---- D1 (control-plane state) -------------------------------------------------
 [[d1_databases]]
@@ -37,6 +53,19 @@ bucket_name = "pukucloud-snapshots"
 [[kv_namespaces]]
 binding = "CACHE"
 id = "REPLACE_WITH_KV_ID"
+
+# ---- Durable Object: per-worker live state -----------------------------------
+# One DO instance per agent host. Agents write state on heartbeats; the
+# controller reads state for the dashboard.
+# Run `wrangler deploy` once first; wrangler will create the class, then
+# re-deploy to bind it.
+[[durable_objects.bindings]]
+name = "WORKER_STATE_DO"
+class_name = "WorkerStateDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkerStateDO"]
 
 # ---- Secrets (set with `wrangler secret put ...`) -----------------------------
 # PUKUCLOUD_AGENT_TOKEN       — bearer shared with agents

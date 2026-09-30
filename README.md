@@ -60,8 +60,11 @@ curl -sS http://localhost:8080/v1/sandboxes/<id>/exec \
 > - Apple Silicon local dev — [docs/setup-local-mac.md](docs/setup-local-mac.md)
 > - Linux KVM local dev — [docs/setup-local-linux.md](docs/setup-local-linux.md)
 > - Cloudflare control plane — [docs/setup-control-plane-cloudflare.md](docs/setup-control-plane-cloudflare.md)
+> - Self-hosted Temporal + Sentry — [docs/setup-temporal-self-host.md](docs/setup-temporal-self-host.md)
 > - AWS multi-node — [docs/setup-self-host-aws.md](docs/setup-self-host-aws.md)
 > - GCP multi-node — [docs/setup-self-host-gcp.md](docs/setup-self-host-gcp.md)
+>
+> 🚧 **Deploying?** Read [Before you deploy](#before-you-deploy--replace-the-placeholders) first — every checkout ships with example values that **must** be replaced.
 
 ---
 
@@ -91,19 +94,24 @@ curl -sS http://localhost:8080/v1/sandboxes/<id>/exec \
 - Template-based images: OCI images converted to ext4 roots, plus a build pipeline for your own. Four first-party templates ship in the box: `base`, `code-interpreter`, `agent`, `postgres-16`.
 
 ### Operations
-- Audit log + observability backed by Postgres and ClickHouse.
-- Multi-node scheduling with capacity scoring, leases, and slot reconciliation.
+- Workflow orchestration via Temporal (self-hosted or Temporal Cloud).
+- Error monitoring and tracing via Sentry (self-hosted).
+- Durable history in Cloudflare D1; per-agent live state in Cloudflare Durable Objects.
 - Bring-your-own auth: stub mode for dev, JWT verification against any JWKS endpoint (e.g. Supabase).
 
 ---
 
 ## Use it from your code
 
-PukuCloud exposes a token-authenticated REST API. Point any HTTP client at your self-hosted control plane (`http://localhost:8080` for local dev) and authenticate with an API token (`pds_…`):
+PukuCloud exposes a token-authenticated REST API. Point any HTTP client at your control plane (Cloudflare Worker URL in production, `http://localhost:8787` for `wrangler dev`) and authenticate with an API token (`pds_…`):
 
 ```bash
-export PUKUCLOUD_API=http://localhost:8080
-export PUKUCLOUD_API_KEY=pds_local_dev_token
+# In production, set this to your deployed controller URL:
+export PUKUCLOUD_API=https://pukucloud-api.<your-account>.workers.dev
+export PUKUCLOUD_API_KEY=pds_<your-token>
+
+# For local dev with `wrangler dev` running:
+# export PUKUCLOUD_API=http://localhost:8787
 
 # create
 SBX=$(curl -sS "$PUKUCLOUD_API/v1/sandboxes" \
@@ -162,15 +170,240 @@ Full per-directory ownership and reading order: **[docs/repo-layout.md](docs/rep
 
 ---
 
+## Before you deploy — replace the placeholders
+
+Every PukuCloud checkout ships with the same example values (sentry secret key, agent URLs, dashboard URL, D1/KV IDs, etc.). **None of these will work for your deployment** until you replace them. This section is the master checklist.
+
+If you just want to try things locally, the [60-second quickstart](#60-second-quickstart) above is fine — it uses defaults like `pds_local_dev_token` and `localhost:8080`. For any real deployment (staging, prod, even a private cloud), work through this list.
+
+### 🔴 Must replace before any non-local deploy
+
+| Where | Placeholder | How to get the real value |
+|---|---|---|
+| `infra/sentry/docker-compose.yml` (× 3) | `REPLACE_WITH_openssl_rand_hex_32` | Run `openssl rand -hex 32` and paste the 64-char hex output. **Same value in all three places.** |
+| `docker-compose.yml` (× 3) | `${SENTRY_SECRET_KEY:-REPLACE_WITH_openssl_rand_hex_32}` | Same as above, or set `SENTRY_SECRET_KEY` in your shell env. |
+| `docker-compose.dev.yml` (× 2) | `${SENTRY_SECRET_KEY:-REPLACE_WITH_openssl_rand_hex_32}` | Same as above. |
+| `workers/wrangler.toml` line 40 | `database_id = "REPLACE_WITH_D1_ID"` | Run `wrangler d1 create pukucloud-db` and paste the returned ID. |
+| `workers/wrangler.toml` line 55 | `id = "REPLACE_WITH_KV_ID"` | Run `wrangler kv:namespace create CACHE` and paste the returned ID. |
+| `workers/wrangler.toml` line 105 | `database_id = "REPLACE_WITH_STAGING_D1_ID"` | Same as line 40, but for your staging D1 (or delete the `[env.staging]` block if you only deploy once). |
+| `workers/wrangler.toml` line 16 | `PUKUCLOUD_AGENT_URLS = "https://agent-1.internal.example.com:9090,..."` | Your real bare-metal hostnames / IPs. Comma-separated. Use `http://` if you don't terminate TLS in front of the agent. |
+| `workers/wrangler.toml` line 18 | `PUKUCLOUD_DASHBOARD_URL = "https://dashboard.example.com"` | The public URL where the Next.js dashboard will be served. |
+| `workers/wrangler.toml` lines 100-101 | `staging.dashboard.example.com`, `agent-staging.internal.example.com` | Same as above, for your staging env (or remove the staging block). |
+
+### 🟡 Set as environment variables on each bare-metal agent host
+
+These are read by the agent at boot. Set them in your systemd unit, Docker env, or shell before launching the agent:
+
+| Variable | Example value | Notes |
+|---|---|---|
+| `TEMPORAL_ADDRESS` | `temporal.your-domain.tld:7233` | Address of your (self-hosted) Temporal frontend's gRPC port. |
+| `TEMPORAL_NAMESPACE` | `default` | Namespace the agent joins. Match what the controller uses. |
+| `TEMPORAL_TASK_QUEUE` | `pukucloud-microvms` | Task queue the agent polls. Match what the controller uses. |
+| `SENTRY_DSN` | `https://abc123@sentry.your-domain.tld/1` | From Sentry → Settings → Projects → Client Keys (DSN). |
+| `PUKUCLOUD_WORKER_ID` | `host-1` | Unique per agent. Shown in logs and Sentry tags. |
+| `PUKUCLOUD_REGION` | `us-east-1` | Your region tag. Used for D1 writes and dashboard grouping. |
+| `PUKUCLOUD_ENV` | `production` | One of `production`, `staging`, `development`. |
+| `PUKUCLOUD_AGENT_TOKEN` | `<random 32+ char secret>` | Shared with the controller. Generate with `openssl rand -hex 32`. |
+| `PUKUCLOUD_ADMIN_TOKEN` | `<random 32+ char secret>` | Bootstrap admin token. Generate with `openssl rand -hex 32`. |
+
+### 🟡 Set as Cloudflare Worker secrets
+
+Run these from the `workers/` directory. Each command prompts you to paste the value:
+
+```bash
+cd workers
+wrangler secret put TEMPORAL_ADDRESS       # e.g. https://temporal.your-domain.tld:8233
+wrangler secret put SENTRY_DSN             # e.g. https://abc123@sentry.your-domain.tld/1
+wrangler secret put TEMPORAL_AUTH_TOKEN    # only if you enabled auth on Temporal
+wrangler secret put PUKUCLOUD_AGENT_TOKEN  # if you keep the legacy agent proxy path
+wrangler secret put PUKUCLOUD_ADMIN_TOKEN  # bootstrap admin token
+wrangler secret put SUPABASE_JWKS_URL      # leave blank for stub auth (dev only)
+```
+
+Verify with `wrangler secret list`.
+
+### ✅ Verification — did you replace everything?
+
+```bash
+# 1. No more example domains in your real configs
+grep -rE "example\.com|REPLACE_WITH" workers/wrangler.toml infra/sentry/docker-compose.yml docker-compose.yml
+# (should print nothing)
+
+# 2. Cloudflare resources exist
+wrangler d1 list                           # shows pukucloud-db
+wrangler kv:namespace list                 # shows CACHE
+
+# 3. Secrets are set
+wrangler secret list | grep -E "TEMPORAL|SENTRY|TOKEN"
+
+# 4. Agent env is set
+ssh your-agent-host "env | grep -E 'TEMPORAL|SENTRY|PUKUCLOUD'"
+
+# 5. D1 migrations are applied
+wrangler d1 migrations apply pukucloud-db --remote
+```
+
+### Where the placeholders came from
+
+Most `example.com` references in `*.md` files, Terraform examples, and shell-script comments are **just illustrative docs** — they don't affect runtime and don't need to change unless you publish those docs verbatim. The list above is the **runtime-impacting** set.
+
+For Terraform / Ansible / cloud-init placeholders (e.g. `REPLACE_WITH_YOUR_GCS_BUCKET`, `REPLACE_WITH_YOUR_TFSTATE_BUCKET`), see the per-environment setup guides in `docs/setup-self-host-{aws,gcp}.md`.
+
+---
+
+## 15-minute deploy walkthrough (Cloudflare + self-hosted Temporal)
+
+Once the placeholders above are replaced, here's the full deploy flow. Times are rough estimates.
+
+### Step 1 — Bring up Temporal (5 min)
+
+```bash
+cd infra/temporal
+docker compose up -d
+# Wait for "healthy" on pukucloud-temporal
+curl -fsS http://localhost:8233/health
+# → {"status":"SERVING"}
+```
+
+If deploying to a remote host, expose port 7233 (gRPC) and 8233 (HTTP API) behind TLS.
+
+### Step 2 — Bring up Sentry (5 min)
+
+```bash
+# Already ran: openssl rand -hex 32 → pasted into docker-compose.yml
+cd infra/sentry
+docker compose up -d
+# Open http://localhost:9000 and complete the bootstrap wizard.
+# Create two projects: "pukucloud-controller" (Node) and
+# "pukucloud-agent" (Go). Copy each project's DSN.
+```
+
+### Step 3 — Set Cloudflare secrets (2 min)
+
+```bash
+cd workers
+wrangler d1 create pukucloud-db           # copy ID → wrangler.toml
+wrangler kv:namespace create CACHE        # copy ID → wrangler.toml
+
+# Edit wrangler.toml: paste D1 ID, KV ID, your real URLs.
+# Edit infra/sentry/docker-compose.yml if you haven't yet.
+
+wrangler d1 migrations apply pukucloud-db --remote
+wrangler secret put TEMPORAL_ADDRESS      # https://temporal.your-domain.tld:8233
+wrangler secret put SENTRY_DSN            # from Step 2
+wrangler secret put PUKUCLOUD_ADMIN_TOKEN # openssl rand -hex 32
+```
+
+### Step 4 — Deploy the controller (1 min)
+
+```bash
+wrangler deploy
+# Output ends with: "Published pukucloud-api (X.XX sec)"
+# Note your URL: https://pukucloud-api.<account>.workers.dev
+```
+
+### Step 5 — Boot an agent on bare-metal (2 min)
+
+On each host with `/dev/kvm`:
+
+```bash
+# Install the agent binary
+curl -L https://github.com/yourorg/pukucloud/releases/latest/download/agent-linux-amd64 \
+  -o /usr/local/bin/agent && chmod +x /usr/local/bin/agent
+
+# /etc/pukucloud/agent.env (sourced by the systemd unit):
+cat > /etc/pukucloud/agent.env <<'EOF'
+TEMPORAL_ADDRESS=temporal.your-domain.tld:7233
+TEMPORAL_NAMESPACE=default
+TEMPORAL_TASK_QUEUE=pukucloud-microvms
+SENTRY_DSN=https://abc123@sentry.your-domain.tld/1
+PUKUCLOUD_WORKER_ID=host-1
+PUKUCLOUD_REGION=us-east-1
+PUKUCLOUD_ENV=production
+PUKUCLOUD_AGENT_TOKEN=<paste admin token>
+EOF
+
+# /etc/systemd/system/pukucloud-agent.service
+cat > /etc/systemd/system/pukucloud-agent.service <<'EOF'
+[Unit]
+Description=PukuCloud Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/pukucloud/agent.env
+ExecStart=/usr/local/bin/agent
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now pukucloud-agent
+systemctl status pukucloud-agent
+# Look for: "temporal worker registered"
+```
+
+### Step 6 — Verify (1 min)
+
+```bash
+# Health check on controller
+curl -fsS https://pukucloud-api.<account>.workers.dev/healthz
+
+# Trigger a workflow
+TOKEN="<paste admin token>"
+curl -sS -X POST https://pukucloud-api.<account>.workers.dev/v1/sandboxes \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"template":"base"}' | jq
+# → { "id": "vm_<ulid>", "status": "queued" }
+
+# Open Temporal UI at http://temporal.your-domain.tld:8080
+# You should see the workflow transition queued → running → completed
+# within ~30s.
+
+# Open Sentry at http://sentry.your-domain.tld:9000
+# You should see a "LaunchMicroVMWorkflow" transaction with no errors.
+```
+
+### Adding more agents
+
+```bash
+# On a new bare-metal host, repeat Step 5 with a different PUKUCLOUD_WORKER_ID.
+# That's it — Temporal routes new workflows to whichever agent has capacity.
+```
+
+### Rolling back
+
+```bash
+# Disable new workflows (controller keeps serving but stops starting new ones):
+wrangler rollback                                    # revert to previous deploy
+
+# Drain an agent gracefully:
+ssh agent-host-1 systemctl stop pukucloud-agent
+# In-flight activities drain; pending workflows re-route to other agents.
+
+# Tear down Temporal / Sentry (only if you're sure):
+cd infra/temporal && docker compose down -v
+cd infra/sentry && docker compose down -v
+```
+
+---
+
 ## Self-host
 
 | Path | Topology | Doc |
 | --- | --- | --- |
 | Apple Silicon, local dev | Lima microVM with nested virt | [docs/setup-local-mac.md](docs/setup-local-mac.md) |
 | Linux KVM host, local dev | Bare-metal or cloud VM with `/dev/kvm` | [docs/setup-local-linux.md](docs/setup-local-linux.md) |
-| Cloudflare-hosted control plane, any agent fleet | Workers + D1 + R2 + KV + your agent hosts | [docs/setup-control-plane-cloudflare.md](docs/setup-control-plane-cloudflare.md) |
-| AWS multi-node | VPC + edge ASG + agent ASG (`*.metal`) + RDS + ClickHouse | [docs/setup-self-host-aws.md](docs/setup-self-host-aws.md) |
-| GCP multi-node | Private VPC + edge MIG + agent MIG + Cloud SQL + ClickHouse | [docs/setup-self-host-gcp.md](docs/setup-self-host-gcp.md) |
+| Cloudflare-hosted control plane, any agent fleet | Workers + D1 + R2 + KV + Durable Objects + Temporal + Sentry | [docs/setup-control-plane-cloudflare.md](docs/setup-control-plane-cloudflare.md) |
+| Self-hosted Temporal + Sentry | Your own Temporal + Sentry instances, Cloudflare control plane | [docs/setup-temporal-self-host.md](docs/setup-temporal-self-host.md) |
+| AWS multi-node | VPC + edge ASG + agent ASG (`*.metal`) | [docs/setup-self-host-aws.md](docs/setup-self-host-aws.md) |
+| GCP multi-node | Private VPC + edge MIG + agent MIG | [docs/setup-self-host-gcp.md](docs/setup-self-host-gcp.md) |
 
 Single-node community examples live in `examples/terraform/{aws,gcp,fly}/single-node/`.
 
@@ -194,10 +427,10 @@ This repository is the whole engine, not a demo. Everything in the **Open source
 | **Database branching** | — | Branch a running database into an independent copy |
 | **Point-in-time restore** | Restore to latest (used by failover) | Backup browser, clone-to-new-database, restore to any second in the retention window |
 | **Connection hardening** | Direct `postgres://` URL, TLS required | Per-database IP allow lists, rate limits, pooled (PgBouncer) URL |
-| **Scheduler** | Multi-node scheduler, capacity scoring, admission control, leases | Same, running across a managed multi-region fleet |
-| **Observability** | Audit log, events, metrics, Postgres + ClickHouse pipeline | Same, pre-wired and retained for you |
+| **Orchestration** | Temporal workflows + Sentry errors + D1 history + Durable Objects for live state | Same, running across a managed multi-region fleet |
+| **Observability** | Audit log, Temporal history, Sentry errors | Same, pre-wired and retained for you |
 | **Usage limits** | None. Unmetered, uncapped, no billing code | Plan-based, with support and an SLA |
-| **Operations** | You run the KVM hosts, object storage, upgrades, and backups | Managed fleet, managed upgrades, support |
+| **Operations** | You run the KVM hosts, Temporal, Sentry, object storage, upgrades, and backups | Managed fleet, managed upgrades, support |
 
 ---
 

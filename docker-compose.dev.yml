@@ -1,103 +1,196 @@
-# Local development stack for PukuCloud self-hosters.
-#
-# Brings up: Postgres (control plane), ClickHouse (observability),
-# api (control plane), dashboard (web UI).
-#
-# Does NOT bring up the agent / Firecracker — those need /dev/kvm and run
-# directly on the host (or inside a Lima VM on Mac). See scripts/local/.
+# PukuCloud on Linux+KVM — single host self-host.
 #
 # Usage:
-#   docker compose -f docker-compose.dev.yml up -d
-#   # then on the host (Linux with KVM):
-#   cd agent && sudo ./agent --listen :7070
-#   export PUKUCLOUD_AGENT_URL=http://host.docker.internal:7070
-#   docker compose -f docker-compose.dev.yml restart api
+#   1. Host must be Linux x86_64/arm64 with /dev/kvm available.
+#   2. Drop a Firecracker kernel at ./data/kernels/vmlinux-aarch64 (or x86_64).
+#   3. Drop at least one template at ./data/templates/<name>/{rootfs.ext4,kernel}.
+#   4. docker compose -f docker-compose.dev.yml up -d
+#   5. Open http://localhost:3000
 #
-# Tear down: docker compose -f docker-compose.dev.yml down -v
-#
-# Self-hosters: copy .env.local.example to .env.local and edit. Supabase is
-# intentionally optional — leave it blank to use the file-token auth path.
-
-name: pukucloud-dev
+# This is the minimal self-hosted composition. Production deployments
+# should split agent onto separate hosts, add TLS + reverse proxy,
+# provision managed Temporal + Sentry (or larger self-hosted ones).
 
 services:
-  postgres:
+  temporal:
+    image: temporalio/auto-setup:1.22.5
+    container_name: pukucloud-temporal
+    environment:
+      DB: postgresql
+      POSTGRES_HOST: temporal-postgres
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+      TEMPORAL_CLI_DEFAULT_NAMESPACE: default
+      VISIBILITY_TTL: "168h"
+    ports:
+      - "7233:7233"
+      - "8233:8233"
+    depends_on:
+      temporal-postgres:
+        condition: service_healthy
+
+  temporal-postgres:
     image: postgres:16-alpine
+    container_name: pukucloud-temporal-postgres
     environment:
-      POSTGRES_USER: pukucloud
-      POSTGRES_PASSWORD: pukucloud
-      POSTGRES_DB: pukucloud
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
     volumes:
-      - pg_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+      - temporal_pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pukucloud"]
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
       interval: 5s
       timeout: 3s
       retries: 20
 
-  clickhouse:
-    image: clickhouse/clickhouse-server:24-alpine
+  sentry:
+    image: getsentry/sentry:24.5.1
+    container_name: pukucloud-sentry
+    depends_on:
+      sentry-postgres:
+        condition: service_healthy
+      sentry-redis:
+        condition: service_healthy
     environment:
-      CLICKHOUSE_DB: pukucloud
-      CLICKHOUSE_USER: pukucloud
-      CLICKHOUSE_PASSWORD: pukucloud
-      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
-    volumes:
-      - ch_data:/var/lib/clickhouse
+      SENTRY_SECRET_KEY: "${SENTRY_SECRET_KEY:-REPLACE_WITH_openssl_rand_hex_32}"
+      SENTRY_POSTGRES_HOST: sentry-postgres
+      SENTRY_DB_USER: sentry
+      SENTRY_DB_PASSWORD: sentry
+      SENTRY_REDIS_HOST: sentry-redis
+      SENTRY_SINGLE_ORGANIZATION: "true"
+    command: ["run", "web"]
     ports:
-      - "8123:8123"
       - "9000:9000"
-    ulimits:
-      nofile:
-        soft: 262144
-        hard: 262144
+
+  sentry-worker:
+    image: getsentry/sentry:24.5.1
+    container_name: pukucloud-sentry-worker
+    depends_on:
+      sentry-postgres:
+        condition: service_healthy
+      sentry-redis:
+        condition: service_healthy
+    environment:
+      SENTRY_SECRET_KEY: "${SENTRY_SECRET_KEY:-REPLACE_WITH_openssl_rand_hex_32}"
+      SENTRY_POSTGRES_HOST: sentry-postgres
+      SENTRY_DB_USER: sentry
+      SENTRY_DB_PASSWORD: sentry
+      SENTRY_REDIS_HOST: sentry-redis
+    command: ["run", "worker"]
+
+  sentry-postgres:
+    image: postgres:16-alpine
+    container_name: pukucloud-sentry-postgres
+    environment:
+      POSTGRES_USER: sentry
+      POSTGRES_PASSWORD: sentry
+      POSTGRES_DB: sentry
+    volumes:
+      - sentry_pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      test: ["CMD-SHELL", "pg_isready -U sentry"]
       interval: 5s
       timeout: 3s
       retries: 20
 
-  api:
-    build:
-      context: ./api
-      dockerfile: Dockerfile
-    environment:
-      PUKUCLOUD_LISTEN: ":8080"
-      PUKUCLOUD_AGENT_URL: ${PUKUCLOUD_AGENT_URL:-http://host.docker.internal:7070}
-      PUKUCLOUD_POSTGRES_URL: postgres://pukucloud:pukucloud@postgres:5432/pukucloud?sslmode=disable
-      PUKUCLOUD_CLICKHOUSE_URL: http://pukucloud:pukucloud@clickhouse:8123/pukucloud
-      PUKUCLOUD_TOKENS_FILE: /tokens/tokens.json
-      # Supabase auth is OPTIONAL — leave blank for token-file auth.
-      SUPABASE_JWKS_URL: ${SUPABASE_JWKS_URL:-}
-      SUPABASE_ISSUER: ${SUPABASE_ISSUER:-}
-      SUPABASE_AUDIENCE: ${SUPABASE_AUDIENCE:-}
-    volumes:
-      - ./scripts/local/tokens:/tokens:ro
-    ports:
-      - "8080:8080"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      clickhouse:
-        condition: service_healthy
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+  sentry-redis:
+    image: redis:7-alpine
+    container_name: pukucloud-sentry-redis
 
-  dashboard:
+  agent:
     build:
-      context: ./dashboard
-      dockerfile: Dockerfile
-      args:
-        NEXT_PUBLIC_PUKUCLOUD_API: http://localhost:8080
+      context: .
+      dockerfile: deploy/Dockerfile.agent
+    image: pukucloud/agent:latest
+    container_name: pukucloud-agent
+    privileged: true
+    devices:
+      - /dev/kvm:/dev/kvm
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    volumes:
+      - ./data:/var/lib/pukucloud
+      - /var/run/pukucloud:/var/run/pukucloud
     environment:
-      NEXT_PUBLIC_PUKUCLOUD_API: http://localhost:8080
+      - PUKUCLOUD_AGENT_LISTEN=0.0.0.0:9090
+      - PUKUCLOUD_DATA_DIR=/var/lib/pukucloud
+      - PUKUCLOUD_METRICS_LISTEN=0.0.0.0:9100
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=default
+      - TEMPORAL_TASK_QUEUE=pukucloud-microvms
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - PUKUCLOUD_ENV=development
     ports:
-      - "3000:3000"
+      - "9090:9090"
+      - "9100:9100"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/v1/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     depends_on:
-      - api
+      temporal:
+        condition: service_started
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    container_name: pukucloud-otel-collector
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ./deploy/monitoring/otel-collector/config.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "8889:8889"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: pukucloud-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./deploy/monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    depends_on:
+      - otel-collector
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: pukucloud-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+      - GF_SECURITY_COOKIE_SAMESITE=none
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/pukucloud.json
+    volumes:
+      - ./deploy/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3030:3000"
+    restart: unless-stopped
+    depends_on:
+      - prometheus
 
 volumes:
-  pg_data:
-  ch_data:
+  prometheus-data:
+  grafana-data:
+  temporal_pg_data:
+  sentry_pg_data:

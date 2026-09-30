@@ -1,0 +1,108 @@
+# Self-hosted Sentry for PukuCloud.
+#
+# Minimal stack: Postgres (metadata), Redis (cache + Celery broker), and
+# the Sentry web/worker/beat services. Sentry's official on-prem image is
+# fairly heavy; this is a simplified composition tuned for low-traffic
+# self-hosted use. For real production, follow Sentry's official
+# "self-hosted" install (https://github.com/getsentry/self-hosted).
+#
+# Usage:
+#   cd infra/sentry
+#   docker compose up -d
+#   # open http://localhost:9000 and complete the bootstrap wizard
+#
+# This is a STARTING POINT. For real production:
+#   - Replace postgres with a managed instance
+#   - Add an SMTP relay for outbound mail
+#   - Provision a real SENTRY_SECRET_KEY (openssl rand -hex 32)
+
+name: pukucloud-sentry
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pukucloud-sentry-postgres
+    environment:
+      POSTGRES_USER: sentry
+      POSTGRES_PASSWORD: sentry
+      POSTGRES_DB: sentry
+    volumes:
+      - sentry_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentry"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: pukucloud-sentry-redis
+    volumes:
+      - sentry_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  sentry:
+    image: getsentry/sentry:24.5.1
+    container_name: pukucloud-sentry
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SENTRY_SECRET_KEY: "REPLACE_WITH_openssl_rand_hex_32"
+      SENTRY_POSTGRES_HOST: postgres
+      SENTRY_POSTGRES_PORT: 5432
+      SENTRY_DB_USER: sentry
+      SENTRY_DB_PASSWORD: sentry
+      SENTRY_REDIS_HOST: redis
+      SENTRY_REDIS_PORT: 6379
+      SENTRY_SINGLE_ORGANIZATION: "true"
+      SENTRY_DEFAULT_DSN_SCHEME: http
+    command: ["run", "web"]
+    ports:
+      - "9000:9000"
+
+  sentry-worker:
+    image: getsentry/sentry:24.5.1
+    container_name: pukucloud-sentry-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SENTRY_SECRET_KEY: "REPLACE_WITH_openssl_rand_hex_32"
+      SENTRY_POSTGRES_HOST: postgres
+      SENTRY_POSTGRES_PORT: 5432
+      SENTRY_DB_USER: sentry
+      SENTRY_DB_PASSWORD: sentry
+      SENTRY_REDIS_HOST: redis
+      SENTRY_REDIS_PORT: 6379
+    command: ["run", "worker"]
+
+  sentry-cron:
+    image: getsentry/sentry:24.5.1
+    container_name: pukucloud-sentry-cron
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SENTRY_SECRET_KEY: "REPLACE_WITH_openssl_rand_hex_32"
+      SENTRY_POSTGRES_HOST: postgres
+      SENTRY_POSTGRES_PORT: 5432
+      SENTRY_DB_USER: sentry
+      SENTRY_DB_PASSWORD: sentry
+      SENTRY_REDIS_HOST: redis
+      SENTRY_REDIS_PORT: 6379
+    command: ["run", "cron"]
+
+volumes:
+  sentry_pg_data:
+  sentry_redis_data:

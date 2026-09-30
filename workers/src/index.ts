@@ -10,6 +10,8 @@ import { tokenRoutes } from "./routes/tokens.ts";
 import { internalRoutes } from "./routes/internal.ts";
 import { proxyToAgent } from "./services/agentProxy.ts";
 import { getSink } from "./services/clickhouse.ts";
+import { captureException } from "./services/sentry.ts";
+import { WorkerStateDO } from "./durable_objects/workerState.ts";
 import type { Env, Variables } from "./types/env.ts";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -23,6 +25,11 @@ app.use("/v1/*", unifiedAuth);
 app.route("/", healthRoutes);
 
 // Control-plane routes registered *before* the catch-all proxy.
+//
+// Sandbox / database / route DELETE / REST routes now start Temporal
+// workflows instead of proxying directly to agents. The Temporal
+// server is the only thing the controller knows the address of;
+// workers come and go without controller changes.
 app.route("/v1", sandboxRoutes);
 app.route("/v1", databaseRoutes);
 app.route("/v1", templateRoutes);
@@ -31,10 +38,11 @@ app.route("/v1", orgRoutes);
 app.route("/v1", tokenRoutes);
 app.route("/v1", internalRoutes);
 
-// Catch-all proxy: every remaining /v1/* falls through to the agent.
-// Also handles WS upgrades (Hono passes the Upgrade request through to fetch).
+// Legacy catch-all proxy: every remaining /v1/* falls through to the
+// agent fleet. Kept so existing agent endpoints (e.g. /v1/sandboxes/{id}/exec)
+// still work while we migrate them to be worker-driven. New code should
+// prefer Temporal activities for orchestration.
 app.all("/v1/*", (c) => {
-  // Extract a routing key when the path looks like /v1/{plural}/{id}/...
   const m = c.req.path.match(/^\/v1\/(sandboxes|databases)\/([^/]+)/);
   return proxyToAgent(c.req.raw, c.env, {
     routingKey: m ? m[2] : undefined,
@@ -44,10 +52,32 @@ app.all("/v1/*", (c) => {
 // Anything else: 404
 app.all("*", (c) => c.json({ error: { code: "not_found", message: "no such route" } }, 404));
 
+// Sentry capture for uncaught errors. Hono's onError fires after the
+// route chain throws, so this is the last-chance handler.
+app.onError(async (err, c) => {
+  await captureException(c.env, err, {
+    tags: {
+      path: c.req.path,
+      method: c.req.method,
+    },
+  });
+  return c.json(
+    { error: { code: "internal_error", message: err.message ?? "internal error" } },
+    500,
+  );
+});
+
+// Re-export the Durable Object class so wrangler can find it. wrangler
+// scans the entrypoint for classes matching [[durable_objects.bindings]]
+// in wrangler.toml. Without this re-export, deploy fails with
+// "WorkerStateDO is not exported in your entrypoint file".
+export { WorkerStateDO } from "./durable_objects/workerState.ts";
+
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const res = await app.fetch(req, env, ctx);
-    // Best-effort periodic ClickHouse flush.
+    // Best-effort periodic ClickHouse flush (kept for analytics during
+    // migration; we'll remove this once D1 fully replaces ClickHouse).
     ctx.waitUntil(getSink().maybeFlush(env));
     return res;
   },

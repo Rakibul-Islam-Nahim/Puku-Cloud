@@ -29,8 +29,11 @@ import (
 	"github.com/pukucloud/agent/internal/network"
 	"github.com/pukucloud/agent/internal/obs"
 	"github.com/pukucloud/agent/internal/sandbox"
+	agentsentry "github.com/pukucloud/agent/internal/sentry"
 	"github.com/pukucloud/agent/internal/slotstore"
 	"github.com/pukucloud/agent/internal/store"
+	agenttemporal "github.com/pukucloud/agent/internal/temporal"
+	"github.com/pukucloud/agent/internal/temporal/activities"
 )
 
 func main() {
@@ -55,6 +58,16 @@ func main() {
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(log)
+
+	// Sentry init (no-op when SENTRY_DSN is unset). We initialize early
+	// so any subsequent init failures are reported.
+	if err := agentsentry.Init(
+		strings.TrimSpace(os.Getenv("SENTRY_DSN")),
+		strings.TrimSpace(os.Getenv("PUKUCLOUD_ENV")),
+		api.Version().Semver,
+	); err != nil {
+		log.Warn("sentry init failed (continuing without error reporting)", "err", err)
+	}
 
 	cfg := config.Config{
 		SocketPath: *socketPath,
@@ -417,8 +430,41 @@ func run(cfg config.Config, idleAfter time.Duration, metricsListen, listenTCP st
 		}()
 	}
 
+	// Temporal worker. Polls a task queue on the configured Temporal
+	// server for activities (LaunchMicroVM, PauseMicroVM, etc.). The
+	// controller starts workflows here; we just execute them. To add
+	// capacity, just start more agents with the same TEMPORAL_ADDRESS.
+	tcfg := agenttemporal.FromEnv()
+	region := strings.TrimSpace(os.Getenv("PUKUCLOUD_REGION"))
+	host, _ := os.Hostname()
+	if tcfg.WorkerID == "worker" {
+		tcfg.WorkerID = host
+	}
+	deps := activities.Deps{
+		Manager:   mgr,
+		WorkerID:  tcfg.WorkerID,
+		Region:    region,
+		SentryEnv: strings.TrimSpace(os.Getenv("PUKUCLOUD_ENV")),
+	}
+	go func() {
+		// Wrap the worker's lifecycle in a context tied to the main
+		// signal context so we shut down with the rest of the agent.
+		if err := agenttemporal.Run(ctx, tcfg, deps); err != nil {
+			log.Error("temporal worker stopped", "err", err)
+			agentsentry.CaptureException(err, map[string]string{"component": "temporal_worker"})
+		}
+	}()
+	log.Info("temporal worker registered",
+		"address", tcfg.Address,
+		"task_queue", tcfg.TaskQueue,
+		"worker_id", tcfg.WorkerID,
+		"region", region,
+	)
+
 	<-ctx.Done()
 	log.Info("shutting down")
+	// Sentry flush so any pending events get sent before exit.
+	agentsentry.Flush(context.Background(), 5*time.Second)
 
 	// Phase 1 always-on: graceful hibernate of persistent sandboxes BEFORE
 	// we tear down HTTP/TCP listeners. Each sandbox's PauseAndSnapshot writes

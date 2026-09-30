@@ -57,6 +57,7 @@ export type Sandbox = {
   memory_mb: number;
   status:
     | "creating"
+    | "queued"         // new: waiting for Temporal to route the activity
     | "running"
     | "paused"
     | "stopping"
@@ -70,6 +71,8 @@ export type Sandbox = {
   from_snapshot?: string;
   metadata?: Record<string, string>;
   created_at: string;
+  // Live workflow status from Temporal (when in flight).
+  workflow_status?: "Running" | "Completed" | "Failed" | "Canceled" | "Terminated" | "TimedOut";
 };
 
 export type CreateRequest = {
