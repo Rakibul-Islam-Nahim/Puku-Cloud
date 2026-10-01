@@ -413,7 +413,7 @@ var reservedMeta = []string{"workspace", "kind", "app.id"}
 // A tenant CANNOT forge these: the control-plane auth middleware overwrites
 // this header with the caller's real auth method on every authenticated
 // request, and deletes it outright on its one bypass path — the header is
-// trustworthy for exactly that reason (see api/cmd/api/auth.go).
+// trustworthy for exactly that reason.
 var platformAuthMethods = map[string]bool{
 	"apps-api":      true,
 	"templates-api": true,

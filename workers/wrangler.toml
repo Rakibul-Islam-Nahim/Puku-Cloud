@@ -70,12 +70,10 @@ new_sqlite_classes = ["WorkerStateDO"]
 # ---- Secrets (set with `wrangler secret put ...`) -----------------------------
 # PUKUCLOUD_AGENT_TOKEN       — bearer shared with agents
 # PUKUCLOUD_ADMIN_TOKEN       — bootstrap admin token
+# PUKUCLOUD_CONTROLLER_URL    — agents use this to post heartbeats back
 # SUPABASE_JWKS_URL            — JWKS endpoint (or empty to disable JWT auth)
 # SUPABASE_ISSUER              — expected `iss` claim
 # SUPABASE_AUDIENCE            — expected `aud` claim
-# CLICKHOUSE_URL               — ClickHouse Cloud HTTPS endpoint
-# CLICKHOUSE_USER
-# CLICKHOUSE_PASSWORD
 # R2_SNAPSHOT_TOKEN            — optional signed-token for R2 Range GETs
 # CLOUDFLARE_API_TOKEN         — only if we need to manage DNS at request-time
 

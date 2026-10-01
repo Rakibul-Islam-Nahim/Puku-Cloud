@@ -30,14 +30,12 @@ export interface Env {
   WORKER_STATE_DO?: DurableObjectNamespace;
 
   // ---- Secrets ------------------------------------------------------------
-  PUKUCLOUD_AGENT_TOKEN?: string;        // bearer shared with agents (legacy path)
+  PUKUCLOUD_AGENT_TOKEN?: string;        // bearer shared with agents
+  PUKUCLOUD_CONTROLLER_URL?: string;     // agents use this to heartbeat back
   PUKUCLOUD_ADMIN_TOKEN?: string;        // bootstrap admin token
   SUPABASE_JWKS_URL?: string;
   SUPABASE_ISSUER?: string;
   SUPABASE_AUDIENCE?: string;
-  CLICKHOUSE_URL?: string;
-  CLICKHOUSE_USER?: string;
-  CLICKHOUSE_PASSWORD?: string;
   R2_SNAPSHOT_TOKEN?: string;             // optional signed-token for R2 Range GETs
   AUTH_MODE?: "tokens" | "jwt" | "stub";  // default: 'tokens' if PUKUCLOUD_ADMIN_TOKEN set, else 'stub'
 }

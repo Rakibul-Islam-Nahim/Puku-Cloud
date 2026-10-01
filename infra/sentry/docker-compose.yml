@@ -63,6 +63,18 @@ services:
       SENTRY_REDIS_PORT: 6379
       SENTRY_SINGLE_ORGANIZATION: "true"
       SENTRY_DEFAULT_DSN_SCHEME: http
+      # ---- SMTP (Phase 6 hardening) ------------------------------------
+      # Set SENTRY_EMAIL_HOST / SENTRY_EMAIL_PORT / SENTRY_EMAIL_USER /
+      # SENTRY_EMAIL_PASSWORD / SENTRY_EMAIL_FROM (and SENTRY_EMAIL_USE_TLS
+      # if your relay requires it) to enable outbound alert mail. With
+      # these unset, Sentry still ingests events; alerts just stay in the
+      # web UI. Production deployments should set them.
+      SENTRY_EMAIL_HOST: "${SENTRY_EMAIL_HOST:-}"
+      SENTRY_EMAIL_PORT: "${SENTRY_EMAIL_PORT:-587}"
+      SENTRY_EMAIL_USER: "${SENTRY_EMAIL_USER:-}"
+      SENTRY_EMAIL_PASSWORD: "${SENTRY_EMAIL_PASSWORD:-}"
+      SENTRY_EMAIL_FROM: "${SENTRY_EMAIL_FROM:-sentry@example.com}"
+      SENTRY_EMAIL_USE_TLS: "${SENTRY_EMAIL_USE_TLS:-1}"
     command: ["run", "web"]
     ports:
       - "9000:9000"

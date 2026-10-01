@@ -6,7 +6,6 @@ A guided tour of every top-level directory in the PukuCloud repository: what it 
 
 - [How the repo is organized](#how-the-repo-is-organized)
 - [Source code](#source-code)
-  - [`api/`](#api)
   - [`agent/`](#agent)
   - [`cmd/pukucloud/`](#cmdpukucloud)
   - [`db-proxy/`](#db-proxy)
@@ -39,15 +38,10 @@ Brand assets, license, governance, and contributor docs sit alongside as project
 
 ## Source code
 
-### `api/`
-
-Self-hosted control-plane REST API, written in Go.
-
-- **Owns:** REST surface for sandboxes, databases, templates, snapshots, volumes, orgs, tokens; the scheduler; Postgres-backed control-plane state; audit + events + metrics emission; OpenAPI spec.
-- **Module path:** `github.com/pukucloud/api`
-- **Entry point:** `cmd/api/main.go`
-- **Start reading:** `cmd/api/main.go` for route registration, then `internal/obs/` for cross-cutting telemetry.
-- **Adjacent docs:** none specific; everything routes through `cmd/api/main.go`.
+> The previous Go `api/` directory was removed in Phase 3 of the
+> Temporal/Sentry/D1/DO migration. The control plane is the Cloudflare
+> Worker in `workers/`. See [PLAN.md § Phase 3](../PLAN.md) and
+> [architecture.md](architecture.md) for the migration story.
 
 ### `agent/`
 

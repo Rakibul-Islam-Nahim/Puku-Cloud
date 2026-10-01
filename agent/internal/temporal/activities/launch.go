@@ -75,6 +75,12 @@ func LaunchMicroVM(ctx context.Context, spec workflows.MicroVMSpec) (*workflows.
 		}
 	}()
 
+	// Mirror the heartbeat to the controller's per-worker Durable Object
+	// so the dashboard can show live agent state. Best-effort: failures
+	// here don't fail the launch.
+	stopCtrlHB := StartHeartbeat(ctx, deps, "launching", "")
+	defer stopCtrlHB()
+
 	vm, err := deps.Manager.Create(ctx, req)
 	if err != nil {
 		reportErr(ctx, err, map[string]string{"phase": "create"})
@@ -157,6 +163,8 @@ func SnapshotMicroVM(ctx context.Context, vmID, snapshotName string) error {
 		return fmt.Errorf("activity deps missing")
 	}
 	recordHeartbeat(ctx, 0, "snapshot start")
+	stopCtrlHB := StartHeartbeat(ctx, deps, "snapshotting", vmID)
+	defer stopCtrlHB()
 
 	// Snapshotting can take minutes for large memory. Heartbeat every 10s.
 	done := make(chan struct{})

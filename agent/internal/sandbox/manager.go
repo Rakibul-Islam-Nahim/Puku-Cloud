@@ -123,13 +123,6 @@ type Manager struct {
 	// loop is disabled or cgroup delegation is unavailable). See cputiers.go.
 	cpuTiers *cpuTiers
 
-	// metricsPoll holds per-VM state (last cpu.stat usage_usec + wallclock)
-	// for the sandbox_metrics historical-chart sampler in ch_sink.go. Kept
-	// separate from cpuTiers's own lastUsec — the two loops need independent
-	// baselines because they run on different cadences. Initialized lazily
-	// by StartMetricsPoller on the first tick.
-	metricsPoll *metricsPollState
-
 	// pendingPGCreds carries credentials that an in-place database restore wants
 	// kickPGPhase2 to RE-INJECT (rather than rotate to fresh ones), so the
 	// connection string survives the restore unchanged. Set by RestoreDatabase
@@ -182,7 +175,6 @@ type Manager struct {
 
 	seedStore *seed.Store
 
-	ch      CHSink
 	agentID string
 
 	dmsnap *DMSnapManager
@@ -3637,4 +3629,18 @@ func (m *Manager) WorkspaceForRequest(ctx context.Context, headerWS, sandboxID s
 		return md["workspace"]
 	}
 	return ""
+}
+
+
+// The chBoot / chEvent / chMetric / chMetric stubs below replace the previous
+// ClickHouse analytics sink. Lifecycle events still happen; we just don't
+// ship them anywhere until an analytics destination is decided (D1 audit_log
+// rows are already written for state-changing actions, so the no-op is
+// consistent with the rest of the migration). All methods are nil-safe and
+// no-op when m is nil so existing call sites in this file compile cleanly.
+func (m *Manager) chBoot(_ string, _ string, _ string, _ string, _ string, _ int64) {
+}
+func (m *Manager) chEvent(_ string, _ string, _ string, _ string, _ string, _ map[string]any) {
+}
+func (m *Manager) chMetric(_ string, _ string, _ float32, _ uint64) {
 }

@@ -165,8 +165,8 @@ If something goes wrong:
 
 ## 7. After cutover
 
-- The Go API at `../api/` is read-only; you can keep it for reference or
-  delete it.
+- The Go API at `../api/` has been deleted (Phase 3 of the migration
+  tracked in `PLAN.md`).
 - The agent fleet at `../agent/` continues to run unchanged.
 - `agent/internal/{snapstore,memstream,diskstream}/` gain an `r2`
   adapter; `gcs` stays as the default for self-hosters who haven't

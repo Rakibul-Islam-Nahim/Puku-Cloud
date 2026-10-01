@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/pukucloud/agent/internal/api"
-	"github.com/pukucloud/agent/internal/clickhouse"
 	"github.com/pukucloud/agent/internal/config"
 	"github.com/pukucloud/agent/internal/diskstream"
 	"github.com/pukucloud/agent/internal/events"
@@ -226,22 +225,10 @@ func run(cfg config.Config, idleAfter time.Duration, metricsListen, listenTCP st
 		}
 	}
 
-	// ClickHouse analytics sink. nil-safe; no-op when env unset.
-	var chWriter *clickhouse.Client
-	if chCfg, cerr := clickhouse.FromEnv(); cerr != nil {
-		log.Warn("clickhouse env parse failed", "err", cerr)
-	} else if chCfg.URL != "" {
-		if serr := clickhouse.EnsureSchema(context.Background(), chCfg, clickhouse.SchemaDDL); serr != nil {
-			log.Warn("clickhouse schema bootstrap failed — analytics may be incomplete", "err", serr)
-		}
-		chWriter = clickhouse.New(context.Background(), chCfg, log)
-		agentIDForCH := strings.TrimSpace(os.Getenv("PUKUCLOUD_AGENT_ID"))
-		if agentIDForCH == "" {
-			agentIDForCH, _ = os.Hostname()
-		}
-		mgr.SetCHSink(chWriter, agentIDForCH)
-		log.Info("clickhouse analytics sink enabled", "agent_id", agentIDForCH)
-	}
+	// ClickHouse analytics sink removed (Phase 4). Lifecycle events are still
+	// recorded via the D1 audit_log on the controller side (see workers/src/
+	// routes/sandboxes.ts and friends). chBoot/chEvent/chMetric on the
+	// Manager are now no-op stubs so existing call sites compile cleanly.
 
 	router := api.NewRouter(mgr, log)
 	var handler http.Handler
@@ -362,9 +349,6 @@ func run(cfg config.Config, idleAfter time.Duration, metricsListen, listenTCP st
 	// PUKUCLOUD_DB_IDLE_AFTER_SECONDS (0/unset = disabled). Wake-on-connect
 	// in db-proxy + the broker proxy resumes them transparently.
 	mgr.StartDBIdleSweep(ctx)
-
-	// 15s ClickHouse metrics poller (no-op if CH sink unset).
-	mgr.StartMetricsPoller(ctx, 15*time.Second)
 
 	go func() {
 		log.Info("agent listening", "socket", cfg.SocketPath)
@@ -499,9 +483,6 @@ func run(cfg config.Config, idleAfter time.Duration, metricsListen, listenTCP st
 	}
 	if tracerShutdown != nil {
 		_ = tracerShutdown(shutCtx)
-	}
-	if chWriter != nil {
-		_ = chWriter.Close(shutCtx)
 	}
 	return srv.Shutdown(shutCtx)
 }

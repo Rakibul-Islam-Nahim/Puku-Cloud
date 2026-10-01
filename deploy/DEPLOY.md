@@ -102,8 +102,9 @@ gcloud secrets versions add pukucloud-database-url --data-file=./db-url.txt
 **Available secrets:**
 | Secret name | Used by |
 |---|---|
-| `pukucloud-database-url` | Edge + Agent (Postgres DSN) |
-| `pukucloud-clickhouse-url` | Edge + Agent (ClickHouse HTTP URL, auto-managed by TF) |
+| `pukucloud-temporal-address` | Edge + Agent (Temporal HTTP/grpc endpoint) |
+| `pukucloud-temporal-auth-token` | Edge + Agent (Temporal bearer, optional) |
+| `pukucloud-sentry-dsn` | Edge + Agent (self-hosted Sentry DSN) |
 | `pukucloud-node-token` | Edge + Agent (bearer auth between edge↔agent) |
 | `pukucloud-supabase-jwks-url` | Edge (JWT verification) |
 
@@ -119,7 +120,7 @@ gcloud compute instance-groups managed rolling-action replace pukucloud-edge-mig
 
 ```bash
 curl -fsS https://api.<your-zone>/healthz | jq .
-# Expected: {"status":"ok","checks":{"PUKUCLOUD_DB_DSN":"ok"}}
+# Expected: {"status":"ok"}
 
 curl -fsS https://api.<your-zone>/version | jq .
 ```
@@ -143,20 +144,34 @@ gcloud compute instances get-serial-port-output <edge-instance-name> \
 
 ---
 
-## ClickHouse
+## Temporal
 
-ClickHouse runs on a dedicated VM `pukucloud-clickhouse-1` (us-central1-a, no public IP).  
-Data is on a persistent disk `pukucloud-clickhouse-data` — survives VM recreation.  
-Internal URL is auto-written to Secret Manager as `pukucloud-clickhouse-url` by Terraform.
+Temporal runs on a dedicated VM `pukucloud-temporal-1` (us-central1-a, no public IP).
+Data is on a persistent disk `pukucloud-temporal-data` — survives VM recreation.
+Internal address is auto-written to Secret Manager as `pukucloud-temporal-address`.
 
 ```bash
-# Check ClickHouse status
-gcloud compute instances describe pukucloud-clickhouse-1 --zone=us-central1-a \
+# Check Temporal status
+gcloud compute instances describe pukucloud-temporal-1 --zone=us-central1-a \
   --format="value(status,networkInterfaces[0].networkIP)"
 
 # View startup log
-gcloud compute instances get-serial-port-output pukucloud-clickhouse-1 \
-  --zone=us-central1-a | grep -E "clickhouse|schema|bootstrap|error" | tail -20
+gcloud compute instances get-serial-port-output pukucloud-temporal-1 \
+  --zone=us-central1-a | grep -E "temporal|schema|bootstrap|error" | tail -20
+```
+
+---
+
+## Sentry (self-hosted)
+
+Sentry runs on a dedicated VM `pukucloud-sentry-1` (us-central1-a). It needs its
+own Postgres + Redis (those are part of the Sentry terraform stack and are NOT
+this project's control-plane state). Internal DSN is auto-written to Secret
+Manager as `pukucloud-sentry-dsn`.
+
+```bash
+gcloud compute instances describe pukucloud-sentry-1 --zone=us-central1-a \
+  --format="value(status,networkInterfaces[0].networkIP)"
 ```
 
 ---

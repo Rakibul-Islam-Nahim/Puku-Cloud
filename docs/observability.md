@@ -29,7 +29,7 @@ Three signal types, three storage paths:
 | Operational logs | journald (host), Worker tail logs (Cloudflare) | All processes | `journalctl`, `wrangler tail` | Disk-bounded |
 | Prometheus metrics | Agent `:9100/metrics`, API `:8080/metrics` | Prometheus client_golang | Prometheus scrape | Per-scrape |
 
-The control plane treats analytics as **best-effort** — a missing ClickHouse never blocks a request. See `mwClickHouseLog` in `api/cmd/api/clickhouse.go`: if the writer is nil, the middleware is a no-op. Operators see this as charts that silently flatten; requests still succeed.
+The control plane treats analytics as **best-effort**. With Phase 4 (ClickHouse removal), time-series analytics are deferred; state-changing actions still land in the D1 `audit_log` table and per-worker live state lives in the WorkerStateDO. Operators see the dashboard's audit + workers pages for current visibility.
 
 ---
 
@@ -42,15 +42,14 @@ The single source of truth for everything dashboard-visible. Schema is bootstrap
 | Table | Row shape | Cardinality control |
 | --- | --- | --- |
 | `pukucloud.http_requests` | `(ts, workspace_id, request_id, method, route, status, duration_ms, actor_id, ip, user_agent)` | `route` is normalized via `normalizeRoute` — path-segment IDs collapse to `:id` so `GET /v1/sandboxes/abc123` and `GET /v1/sandboxes/xyz789` share one row key |
-| `pukucloud.boot_events` | `(ts, workspace_id, sandbox_id, template, boot_ms, boot_mode)` | `boot_mode` is `cold` / `warm` / `paused` so dashboard can show the warm-create ratio |
-| `pukucloud.sandbox_metrics` | `(ts, workspace_id, sandbox_id, cpu_pct, mem_bytes)` | Per-sandbox series; queries always filter on `workspace_id` server-side from `X-Fcs-Workspace` |
-| `pukucloud.events` (Workers) | `(ts, org_id, sandbox_id, database_id, kind, payload)` | Workers have a separate sink; format is JSONEachRow into the same ClickHouse Cloud cluster |
+| D1 `audit_log` (Workers) | `(ts, org_id, actor, action, workflow_id, details_json)` | One row per state-changing action. Workers side; written by the controller via the D1 sink (`workers/src/services/clickhouse.ts`). |
 
-The full DDL is embedded in the API binary (`api/internal/clickhouse/SchemaDDL`, `//go:embed schema.sql`). An operator override exists at `/etc/pukucloud/clickhouse-schema.sql` for deployments that need to pin their own schema.
+### ClickHouse: retired
 
-### Why embedded
-
-An earlier version read the DDL from a path next to the binary, which always failed in production (distroless image, no sibling files). Result: every insert failed with `UNKNOWN_TABLE`, charts were silently empty. The fix was to compile the DDL in; the disk path is now an opt-in override.
+The previous ClickHouse-backed time-series analytics were retired in Phase 4.
+For per-agent live state (status, last-seen, capacity), see the dashboard's
+**Workers** page — it reads the controller's `WorkerStateDO`. For action
+history, see the **Audit log** page — it reads `audit_log`.
 
 ---
 

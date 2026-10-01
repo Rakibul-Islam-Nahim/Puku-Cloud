@@ -1,0 +1,66 @@
+# Production overlay for self-hosted Temporal.
+#
+# Brings up the production stack with TLS + bearer auth enabled. Use:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# What this changes vs the dev compose:
+#   1. TEMPORAL_TLS=true — gRPC + HTTP API terminate TLS on the standard
+#      Temporal ports. Mount your certs into /etc/temporal/certs.
+#   2. TEMPORAL_AUTH_ENABLED=true — the server expects client bearer
+#      tokens. Generate one with `tctl` (see README.md) and stash it as
+#      the `TEMPORAL_AUTH_TOKEN` env var consumed by both the controller
+#      and the agent fleet.
+#   3. The frontend / history / matching services are pinned to the same
+#      image as the dev compose; only env + mounts change.
+#
+# Required volumes (created by your platform, NOT by this compose):
+#   /etc/temporal/certs/{server.crt, server.key, ca.crt}
+#
+# Required env vars (export before `docker compose up`):
+#   TEMPORAL_AUTH_TOKEN=<long random bearer>
+#   TEMPORAL_SERVER_NAME=temporal.example.com   # SAN on server.crt
+#
+# Notes:
+#   - We're using the `auto-setup` image with --no-fold and the TLS
+#     flags exposed via env. If you need a custom temporal-server config
+#     (dynamic config.yaml), drop it at /etc/temporal/config/dynamicconfig/
+#     and the container will pick it up via the image's auto-setup logic.
+
+name: pukucloud-temporal-prod
+
+services:
+  postgres:
+    volumes:
+      # Production uses a separate, larger volume and runs at higher
+      # WAL/backup priority. Operators typically attach a managed Postgres
+      # service here instead — point POSTGRES_* at it.
+      - temporal_pg_data_prod:/var/lib/postgresql/data
+
+  temporal:
+    environment:
+      DB: postgresql
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+      TEMPORAL_CLI_DEFAULT_NAMESPACE: default
+      VISIBILITY_TTL: "168h"
+      # ---- TLS ---------------------------------------------------------
+      TEMPORAL_TLS: "true"
+      TEMPORAL_TLS_SERVER_NAME: "${TEMPORAL_SERVER_NAME:-temporal.example.com}"
+      TEMPORAL_TLS_CERT: "/etc/temporal/certs/server.crt"
+      TEMPORAL_TLS_KEY: "/etc/temporal/certs/server.key"
+      # ---- Auth --------------------------------------------------------
+      TEMPORAL_AUTH_ENABLED: "true"
+      TEMPORAL_AUTH_AUTHORIZER: "default"
+      TEMPORAL_AUTH_CLAIM_MAPPER: "default"
+    volumes:
+      - /etc/temporal/certs:/etc/temporal/certs:ro
+    ports:
+      - "7233:7233"
+      - "8233:8233"
+
+volumes:
+  temporal_pg_data_prod:

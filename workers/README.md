@@ -1,10 +1,11 @@
 # PukuCloud on Cloudflare Workers
 
-This directory is the Cloudflare-hosted control plane for PukuCloud. It
-replaces the Go API at `../api/` with a TypeScript + Hono application that
-runs on Cloudflare Workers, with D1 for control-plane state, R2 for
-snapshot / seed storage, KV for cache, and the existing Firecracker
-agents staying on bare-metal / GCP KVM hosts.
+This directory is the Cloudflare-hosted control plane for PukuCloud.
+It is a TypeScript + Hono application that runs on Cloudflare Workers,
+with D1 for control-plane state, R2 for snapshot / seed storage, KV
+for cache, Temporal (self-hosted HTTP API) for workflow orchestration,
+Sentry for error monitoring, and Durable Objects for per-worker live
+state. The Firecracker agents stay on bare-metal / GCP KVM hosts.
 
 ```
 clients ──► Cloudflare Workers (this dir)
@@ -78,11 +79,15 @@ npx wrangler r2 bucket create pukucloud-snapshots
 npx wrangler dev
 ```
 
-In another shell, point a local agent at this Worker:
+In another shell, run an agent against this Worker:
 
 ```bash
-PUKUCLOUD_AGENT_URL=http://localhost:9090 \
-  go run ../api/cmd/api &      # or skip — Workers proxies to a remote agent
+# Run the agent from the agent/ directory.
+# Set PUKUCLOUD_CONTROLLER_URL to the Worker's URL so heartbeats land
+# on /v1/internal/agents/:worker_id/state.
+PUKUCLOUD_CONTROLLER_URL=http://localhost:8787 \
+  PUKUCLOUD_AGENT_TOKEN=<shared-token> \
+  go run . --listen-tcp :9090
 ```
 
 ## Auth

@@ -668,4 +668,35 @@ export type ForkResult = {
   at: string;
 };
 
+// Phase 2: per-agent live state surfaced for the Workers dashboard page.
+// WorkerStateDO is the source of truth; the manifest in D1 carries the
+// worker-id list, and each DO carries the strongly-consistent state.
+export type WorkerState = {
+  worker_id: string;
+  region: string;
+  status: "idle" | "busy" | "launching" | "draining" | "offline";
+  current_vm_id?: string;
+  capacity: {
+    cpu_total: number;
+    cpu_used: number;
+    mem_total_mb: number;
+    mem_used_mb: number;
+  };
+  last_seen: string;
+  workflow_count?: number;
+  version?: string;
+};
+
+export type WorkersList = {
+  workers: WorkerState[];
+};
+
+export async function listWorkers(): Promise<WorkersList> {
+  return call<WorkersList>("/workers");
+}
+
+export async function getWorker(workerId: string): Promise<WorkerState> {
+  return call<WorkerState>(`/workers/${encodeURIComponent(workerId)}`);
+}
+
 

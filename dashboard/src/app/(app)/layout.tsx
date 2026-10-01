@@ -46,6 +46,7 @@ const NAV = [
   { href: "/templates",       label: "Templates",    icon: LayoutGrid, shortcut: "G T" },
   { href: "/volumes",         label: "Volumes",      icon: HardDrive,  shortcut: "" },
   { href: "/snapshots",       label: "Snapshots",    icon: Camera,     shortcut: "" },
+  { href: "/workers",         label: "Workers",      icon: Cpu,        shortcut: "" },
   { href: "/audit",           label: "Audit Log",    icon: Bell,       shortcut: "" },
   { href: "/stats",           label: "Performance",  icon: Activity,   shortcut: "" },
   { href: "/observability",   label: "Observability",icon: LineChart,  shortcut: "" },

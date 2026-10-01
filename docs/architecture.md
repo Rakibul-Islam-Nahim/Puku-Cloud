@@ -244,8 +244,9 @@ Workflows are crash-safe: if an agent dies mid-launch, Temporal re-routes
 the activity to another agent.
 
 The previous Go scheduler (`api/internal/scheduler/`) and the
-`MultiNodeDirector` are deprecated. They were replaced by Temporal's
-built-in task queue routing and retry semantics. See
+`MultiNodeDirector` were removed in Phase 3 along with the entire `api/`
+directory. Temporal's built-in task queue routing + retry semantics +
+the controller's WorkerStateDO (live state) replace them. See
 [orchestration-temporal-sentry-d1-do](#orchestration-temporal--sentry--d1--do)
 above.
 
@@ -269,7 +270,7 @@ Three trust boundaries are enforced by the control plane:
 
 | Boundary | Token / header | Where it's checked |
 | --- | --- | --- |
-| Caller → control plane | `pds_*` API token or JWT (`Authorization: Bearer …`) | Control-plane auth middleware (`api/internal/auth`, `workers/src/middleware/auth.ts`) |
+| Caller → control plane | `pds_*` API token or JWT (`Authorization: Bearer …`) | Control-plane auth middleware (`workers/src/middleware/auth.ts`) |
 | Control plane → agent | `PUKUCLOUD_AGENT_TOKEN` (shared bearer) + `X-Node-Token` for node-to-node | Agent HTTP handler (`agent/internal/api`) |
 | Agent → guest (db-proxy tunnel) | `pds_pg_*` Postgres token (in-VM) | query-broker inside the guest, validated against the parent DB catalog |
 

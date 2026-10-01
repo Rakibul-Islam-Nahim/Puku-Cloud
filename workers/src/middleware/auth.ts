@@ -5,7 +5,7 @@ import { err } from "../util/json.ts";
 import type { AuthMethod, Env, Variables } from "../types/env.ts";
 
 /**
- * Three-mode auth, mirroring api/internal/auth.go priority order:
+ * Three-mode auth:
  *   1. Bearer `pds_*` API token (D1 lookup by prefix, hash compare)
  *   2. Bearer JWT verified by Supabase JWKS (cached in module scope)
  *   3. PUKUCLOUD_AUTH_MODE=stub  →  `X-Stub-User` header
@@ -14,6 +14,8 @@ import type { AuthMethod, Env, Variables } from "../types/env.ts";
  * that can't set Authorization.
  *
  * Skip prefixes: /healthz, /readyz, /version, /metrics, /openapi.json,
+ * /v1/internal/{natid,agents}   (agent endpoints authenticate via
+ * PUKUCLOUD_AGENT_TOKEN inside the route),
  * /v1/databases/{id}/proxy[/...]   (the db-broker path forwards an in-VM
  * pds_pg_… token unchanged).
  */
@@ -24,6 +26,7 @@ export const SKIP_AUTH_PREFIXES = [
   "/metrics",
   "/openapi.json",
   "/v1/internal/natid",
+  "/v1/internal/agents",
 ];
 
 // Module-scope JWKS — jose caches keys internally.
