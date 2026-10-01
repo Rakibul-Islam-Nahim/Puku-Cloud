@@ -103,3 +103,4 @@ templates/postgres-16/query-broker/query-broker
 db-proxy/db-proxy
 docs-site/next-env.d.ts
 PLAN.md
+.puku-cli

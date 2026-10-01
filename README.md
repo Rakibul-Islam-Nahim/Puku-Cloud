@@ -22,37 +22,7 @@ Both products share the same fleet, scheduler, and snapshot pipeline. There is n
 
 ### Architecture (after the refactor)
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       Cloudflare Edge                           │
-│                                                                 │
-│  ┌──────────────┐        ┌────────────────┐                     │
-│  │  Controller  │───────►│ Temporal              │◄──┐           │
-│  │  (Worker)    │        │ (self-hosted)       │   │           │
-│  │              │        └────────────────┘    │           │
-│  │  ├─ D1       │                              │           │
-│  │  │  history  │        ┌────────────────┐    │           │
-│  │  ├─ DO       │───────►│ Sentry              │    │           │
-│  │  │  live     │        │ (self-hosted)       │    │           │
-│  │  ├─ R2       │        └────────────────┘    │           │
-│  │  └─ KV       │                                │           │
-│  └──────────────┘                                 │           │
-└──────────────────────────────────────────────────┼───────────┘
-                                                   │
-                       (gRPC + heartbeats)         │
-                                                   │
-            ┌──────────────────────────────────────┼────────────┐
-            │                                      │            │
-       ┌────┴─────┐                          ┌─────┴────┐       │
-       │ Agent    │                          │ Agent    │  ...  │
-       │ Go       │                          │ Go       │       │
-       │ bare     │                          │ bare     │       │
-       │ metal    │                          │ metal    │       │
-       │ Firecracker│                        │ Firecracker│     │
-       │ +Temporal│                          │ +Temporal│       │
-       │  worker  │                          │  worker │       │
-       └─────────┘                          └─────────┘       │
-```
+![Cloudflare Implementation](git-content/CloudflareDiagram.png)
 
 ### How each piece is built
 
