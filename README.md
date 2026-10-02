@@ -1,9 +1,5 @@
 # PukuCloud
 
-![Architecture](git-content/ReadmeArchitecture.png)
-
----
-
 ## 1. What is PukuCloud, and how is it built?
 
 PukuCloud is an open-source control plane + scheduler for **Firecracker microVMs**, shipping two products on the same engine:

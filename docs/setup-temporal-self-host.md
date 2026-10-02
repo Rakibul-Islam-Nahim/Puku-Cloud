@@ -60,15 +60,14 @@ activities, starts heartbeating. No IP allowlist updates needed.
 ```bash
 cd workers
 # Add to .dev.vars or set with `wrangler secret put`:
-wrangler secret put TEMPORAL_AUTH_TOKEN  # optional, only if you enabled auth
 wrangler secret put SENTRY_DSN
-wrangler secret put TEMPORAL_AUTH_TOKEN  # optional
+wrangler secret put TEMPORAL_AUTH_TOKEN  # optional, only if you enabled auth
 ```
 
 Then set non-secret vars in `wrangler.toml` `[vars]` block:
 
 ```toml
-TEMPORAL_ADDRESS = "https://temporal.example.com:8233"
+TEMPORAL_ADDRESS = "https://temporal.example.com:8233"   # HTTP API
 TEMPORAL_NAMESPACE = "default"
 TEMPORAL_TASK_QUEUE = "pukucloud-microvms"
 ```

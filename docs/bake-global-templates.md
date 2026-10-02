@@ -1,49 +1,36 @@
-# Build & Deploy a Global Template
+# Build & deploy a global template
 
-Global (public/seeded) templates like `base`, `code-interpreter`, and `agent` are
-**not** built via `pukucloud template build`. They are baked directly on an agent VM from
-shell scripts, stored in GCS, and synced to every agent at boot.
+Global (public, seeded) templates like `base`, `code-interpreter`, and `agent` are **not** built via `pukucloud template build`. They are baked directly on a Firecracker host from shell scripts, uploaded to R2, and synced to every agent on startup.
 
-## Architecture Overview
+## Architecture
 
+```mermaid
+flowchart LR
+    A["scripts/build-base-rootfs.sh<br/>(one-time base OS setup)"] --> B["ubuntu-24.04-net/rootfs.ext4<br/>(~2 GB)"]
+    B --> C["scripts/bake-templates.sh<br/>(chroot-installs packages per template)"]
+    C --> D["templates/&lt;name&gt;/rootfs.ext4"]
+    D -->|upload[("R2 bucket<br/>pukucloud-snapshots")]
+    E[("R2<br/>pukucloud-snapshots")] -->|range GET on agent boot| F["/var/lib/pukucloud/templates/"]
+    F -->|InstanceStart --snapshot| G["Firecracker VM"]
 ```
-scripts/build-base-rootfs.sh          # one-time base OS setup
-        │
-        ▼
-ubuntu-24.04-net/rootfs.ext4          # base image (~2 GB)
-        │
-        ▼
-scripts/bake-templates.sh             # chroot-installs packages per template
-        │
-        ▼
-templates/<name>/rootfs.ext4          # baked template image
-        │
-        ▼
-gcloud storage cp → GCS bucket        # push to gs://your-pukucloud-bucket/
-        │
-        ▼ (agent VM boot / cloud-init)
-gcloud storage rsync → /var/lib/pukucloud/templates/   # pulled onto every agent
-        │
-        ▼
-agent boots Firecracker VM → takes snapshot             # warm boot cache
-```
+
+The same `bake-templates.sh` script runs on any agent host (or in CI). After baking, push to the bucket the controller exposes as the `SNAPSHOTS` R2 bucket (`pukucloud-snapshots` by default). Agents pull from there automatically.
 
 ---
 
 ## Prerequisites
 
-- SSH access to an agent VM (e.g. `AGENT_VM_A`, `AGENT_VM_B` below) via IAP
-- GCS bucket name: `your-pukucloud-bucket` (read from VM metadata)
-- Run all bake commands **as root** on the agent VM
+- SSH access to an agent host (a bare-metal host or the Lima VM in local dev).
+- The bucket name must match `SNAPSHOTS` in `workers/wrangler.toml` (default `pukucloud-snapshots`).
+- Run all bake commands **as root** on the agent host (the script bind-mounts `/dev`, `/proc`, `/sys`).
 
 ---
 
-## Step 1 — SSH into an agent VM
+## Step 1 — SSH into an agent host
 
 ```bash
-gcloud compute ssh "$AGENT_VM_A" \
-  --zone="$AGENT_VM_A_ZONE" \
-  --tunnel-through-iap
+ssh user@agent-1
+sudo -i
 ```
 
 ---
@@ -53,156 +40,122 @@ gcloud compute ssh "$AGENT_VM_A" \
 Only needed if `ubuntu-24.04-net` does not exist or you need to rebuild it from scratch.
 
 ```bash
-# On the agent VM, as root:
-sudo PUKUCLOUD_GCS_BUCKET=your-pukucloud-bucket \
-  bash /path/to/scripts/build-base-rootfs.sh
+sudo bash /workspace/scripts/build-base-rootfs.sh
 ```
 
 This will:
-- Run `debootstrap` to create a minimal Ubuntu 24.04 rootfs
-- Install `pukucloud-init` and `pukucloud-autostart` systemd units
-- Output to `/var/lib/pukucloud/templates/ubuntu-24.04-net/rootfs.ext4`
-- Upload the result to GCS automatically if `PUKUCLOUD_GCS_BUCKET` is set
+
+- Run `debootstrap` to create a minimal Ubuntu 24.04 rootfs.
+- Install `pukucloud-init` and `pukucloud-autostart` systemd units.
+- Output to `/var/lib/pukucloud/templates/ubuntu-24.04-net/rootfs.ext4`.
 
 > The base rootfs rarely changes. Skip this step if `/var/lib/pukucloud/templates/ubuntu-24.04-net/rootfs.ext4` already exists.
 
 ---
 
-## Step 3 — Copy bake script to agent VM
+## Step 3 — Bake the template
 
 ```bash
-# From your local machine:
-gcloud compute scp scripts/bake-templates.sh \
-  "$AGENT_VM_A":/tmp/bake-templates.sh \
-  --zone="$AGENT_VM_A_ZONE" \
-  --tunnel-through-iap
-```
-
----
-
-## Step 4 — Bake the template
-
-```bash
-# On the agent VM, as root:
-sudo bash /tmp/bake-templates.sh code-interpreter
+sudo bash /workspace/scripts/bake-templates.sh code-interpreter
 ```
 
 To force a rebuild even if already present:
 
 ```bash
-sudo FORCE=1 bash /tmp/bake-templates.sh code-interpreter
+sudo FORCE=1 bash /workspace/scripts/bake-templates.sh code-interpreter
 ```
 
 To bake all templates at once:
 
 ```bash
-sudo bash /tmp/bake-templates.sh
+sudo bash /workspace/scripts/bake-templates.sh
 ```
 
 What this does:
-1. Clones `ubuntu-24.04-net/rootfs.ext4` as the starting point
-2. Resizes the image to the target `SIZE_MB` (12288 MB for `code-interpreter`)
-3. Mounts the image + bind-mounts `/dev`, `/proc`, `/sys`
-4. Runs `tpl::code-interpreter()` inside a chroot (installs Python 3.11, Node.js 22, full DS/AI/Playwright stack)
-5. Writes the final image to `/var/lib/pukucloud/templates/code-interpreter/rootfs.ext4`
-6. Writes `meta.json` with size, cpu, memory specs
-7. Purges any stale Firecracker snapshot so it gets rebuilt on next sandbox create
+
+1. Clones `ubuntu-24.04-net/rootfs.ext4` as the starting point.
+2. Resizes the image to the target `SIZE_MB` (12288 MB for `code-interpreter`).
+3. Mounts the image + bind-mounts `/dev`, `/proc`, `/sys`.
+4. Runs `tpl::code-interpreter()` inside a chroot (installs Python 3.13, Node.js 24, full DS/AI/Playwright stack).
+5. Writes the final image to `/var/lib/pukucloud/templates/code-interpreter/rootfs.ext4`.
+6. Writes `meta.json` with size, CPU, memory specs.
+7. Purges any stale Firecracker snapshot so it gets rebuilt on next sandbox create.
 
 ---
 
-## Step 5 — Upload to GCS
-
-The bake script does **not** upload automatically. Push manually after baking:
+## Step 4 — Upload to R2
 
 ```bash
-# On the agent VM, as root:
-GCS_BUCKET=your-pukucloud-bucket
+# From your laptop, with wrangler authenticated:
+wrangler r2 object put pukucloud-snapshots/templates/code-interpreter/rootfs.ext4 \
+  --file=/var/lib/pukucloud/templates/code-interpreter/rootfs.ext4 \
+  --remote
 
-gcloud storage cp \
-  /var/lib/pukucloud/templates/code-interpreter/rootfs.ext4 \
-  gs://${GCS_BUCKET}/templates/code-interpreter/rootfs.ext4
+wrangler r2 object put pukucloud-snapshots/templates/code-interpreter/meta.json \
+  --file=/var/lib/pukucloud/templates/code-interpreter/meta.json \
+  --remote
+```
 
-gcloud storage cp \
-  /var/lib/pukucloud/templates/code-interpreter/meta.json \
-  gs://${GCS_BUCKET}/templates/code-interpreter/meta.json
+Replace `pukucloud-snapshots` with whatever you named the `SNAPSHOTS` R2 binding in `wrangler.toml`.
+
+---
+
+## Step 5 — Sync to all agent hosts
+
+Agents download from R2 on first use (the local chunk cache stays warm after that). To force a sync without rebooting, trigger the agent's seed-sync manually:
+
+```bash
+# On each agent host:
+sudo systemctl restart pukucloud-agent
+# Or trigger the in-agent refresh hook (if enabled in your build):
+# sudo pukucloud-agent -snapshot-refresh
+```
+
+If you have not enabled the refresh hook, the simplest approach is to delete the agent's stale cached template and let it re-download on the next boot:
+
+```bash
+sudo systemctl stop pukucloud-agent
+sudo rm -rf /var/lib/pukucloud/templates/code-interpreter
+sudo systemctl start pukucloud-agent
 ```
 
 ---
 
-## Step 6 — Sync to all agent VMs
-
-Agent VMs pull from GCS on boot. To sync without rebooting:
-
-```bash
-# Run on EACH agent VM:
-GCS_BUCKET=your-pukucloud-bucket
-
-sudo gcloud storage rsync --recursive \
-  gs://${GCS_BUCKET}/templates/ \
-  /var/lib/pukucloud/templates/
-
-sudo gcloud storage rsync --recursive \
-  gs://${GCS_BUCKET}/template-snaps/ \
-  /var/lib/pukucloud/template-snaps/
-```
-
-To sync a second agent without logging into it:
-
-```bash
-gcloud compute ssh "$AGENT_VM_B" \
-  --zone="$AGENT_VM_B_ZONE" \
-  --tunnel-through-iap \
-  --command="sudo gcloud storage rsync --recursive gs://your-pukucloud-bucket/templates/ /var/lib/pukucloud/templates/"
-```
-
----
-
-## Step 7 — Verify
+## Step 6 — Verify
 
 ```bash
 # Check template is present on agent:
-gcloud compute ssh "$AGENT_VM_A" \
-  --zone="$AGENT_VM_A_ZONE" \
-  --tunnel-through-iap \
-  --command="cat /var/lib/pukucloud/templates/code-interpreter/meta.json && ls -lh /var/lib/pukucloud/templates/code-interpreter/"
+cat /var/lib/pukucloud/templates/code-interpreter/meta.json
+ls -lh /var/lib/pukucloud/templates/code-interpreter/
 
-# Create a test sandbox using the template via the API:
+# Create a test sandbox using the template:
 curl -X POST "$PUKUCLOUD_API/v1/sandboxes" \
-  -H "Authorization: Bearer <token>" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"template": "code-interpreter"}'
 ```
 
 ---
 
-## Updating a Template Definition
+## Updating a template definition
 
 The source of truth for what gets installed in each template is `scripts/bake-templates.sh`.
 
-- Edit `tpl::<name>()` to change installed packages
-- Edit `SIZE_MB[<name>]` if the image needs more disk space
-- Edit `CPU_COUNT[<name>]` / `MEMORY_MB[<name>]` for different VM sizing
-- The Dockerfiles in `templates/<name>/Dockerfile` must stay in sync with `tpl::<name>()`
+- Edit `tpl::<name>()` to change installed packages.
+- Edit `SIZE_MB[<name>]` if the image needs more disk space.
+- Edit `CPU_COUNT[<name>]` / `MEMORY_MB[<name>]` for different VM sizing.
+- The Dockerfiles in `templates/<name>/Dockerfile` must stay in sync with `tpl::<name>()`.
 
-After editing, repeat Steps 3–6.
+After editing, repeat Steps 3–5.
 
 ---
 
-## Agent VMs Reference
+## Storage backends
 
-Fill these in for your own deployment; every command above reads them from the
-environment so nothing here is deployment-specific:
+| Backend | Status | How to use |
+|---|---|---|
+| **Cloudflare R2** (default) | Production | `wrangler r2 object put … --remote`. The agent pulls via the controller's `SNAPSHOTS` R2 binding, or via a presigned Range GET if `R2_SNAPSHOT_TOKEN` is set. |
+| **GCS** | Adapter present, not exercised by current dev paths. | Set `PUKUCLOUD_GCS_BUCKET` on the agent. |
+| **S3** | Adapter present, not exercised by current dev paths. | Set `PUKUCLOUD_S3_BUCKET` on the agent. |
 
-```bash
-export AGENT_VM_A=<primary-agent-vm>     AGENT_VM_A_ZONE=<zone>
-export AGENT_VM_B=<secondary-agent-vm>   AGENT_VM_B_ZONE=<zone>
-export PUKUCLOUD_API=https://<your-api-host>
-```
-
-| Role | Variable | Purpose |
-|------|----------|---------|
-| Primary agent | `$AGENT_VM_A` | Bakes templates, serves sandboxes |
-| Secondary agent | `$AGENT_VM_B` | Serves sandboxes; pulls baked templates from the bucket |
-| Edge | — | API + dashboard hosts (not involved in baking) |
-
-GCS bucket: `your-pukucloud-bucket`
+The agent's behavior for any backend is identical: on a cache miss it issues a ranged read into the local chunk cache at `/var/lib/pukucloud/templates/`.

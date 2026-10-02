@@ -31,7 +31,7 @@ What to do when Temporal is unavailable and workflows stop being scheduled.
    ```
    Look for `OOMKilled`, `panic`, or "namespace cert has expired".
 
-4. **Is the bundled Postgres healthy?**
+3. **Is the bundled Postgres healthy?**
    ```bash
    docker compose -f infra/temporal/docker-compose.yml exec postgres \
      pg_isready -U temporal
@@ -68,26 +68,18 @@ docker compose -f infra/temporal/docker-compose.yml up -d temporal
 ### Hard: Temporal VM is gone
 
 1. Provision a replacement host.
-3. Restore Postgres from the last nightly snapshot (see
+2. Restore Postgres from the last nightly snapshot (see
    `docs/runbooks/backup-restore.md` if you have one — otherwise this
    is a cold start; pending workflows restart from scratch and
    in-flight activities retry from their last heartbeat).
-4. Start Temporal pointing at the restored Postgres.
-5. Restart the agents (they'll re-subscribe to the task queue within 30 s).
+3. Start Temporal pointing at the restored Postgres.
+4. Restart the agents (they'll re-subscribe to the task queue within 30 s).
 
-### Emergency: bypass Temporal, single-node fallback
-
-If Temporal recovery will take > 30 min, set
-`TEMPORAL_ADDRESS=""` on the controller and agents. The legacy path
-takes the registry → agent direct route. Workflow history is lost (no
-Temporal = no local storage either), but new sandboxes still work.
-
-This is a *temporary* fallback — bring Temporal back up before re-enabling.
+There is no single-node bypass. If Temporal is down, new sandbox creates time out at the controller's `StartWorkflow` deadline. Communicate the outage; do not operate the fleet in a degraded mode that bypasses Temporal.
 
 ## After recovery
 
-- Check the worker manifest in the screenshot is showing all agents back
-  online within 60 s.
+- Confirm `/v1/workers` shows all agents back online within 60 s.
 - Look at `failed` workflows in the Temporal UI — anything that failed
   during the outage will be there with a clear cause.
 - Check Sentry for any workflow that errored mid-recovery and didn't
